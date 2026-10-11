@@ -14,6 +14,11 @@ Usage:
     uv run python scripts/smoke_test_transforms.py --transform <fully.qualified.id>
     uv run python scripts/smoke_test_transforms.py --setting API_KEY=xxx
 
+Each transform is run on one sample input. ``--value`` overrides every sample; otherwise a
+``samples.json`` beside the transforms (``server/transforms/<service>/samples.json``, a
+``{transform_id: input}`` map the scaffolder writes from the request it was given) wins,
+then ``TRANSFORM_SAMPLES``, then the per-entity-type ``SAMPLE_VALUES``.
+
 Credentials are read from ``.env`` at the repository root, so a key written there once is
 picked up by every run. A key exported in the shell overrides the file, as it does for the
 server, and an explicit ``--setting KEY=VALUE`` overrides both for that run. A transform
@@ -29,13 +34,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from transformatron import lifecycle
-from transformatron.client import TransformClient, TransformServerError
+from transformatron.client import RunResult, TransformClient, TransformServerError
 from transformatron.config import load_config
 from transformatron.envfile import load_env_file
 
@@ -58,6 +65,10 @@ SAMPLE_VALUES = {
     "maltego.Malware": "lockbit3",
     "maltego.Company": "hospital",
     "maltego.Country": "US",
+    # Log4Shell: published, heavily referenced, and scored by every vulnerability feed.
+    "maltego.CVE": "CVE-2021-44228",
+    # MD5 of the EICAR anti-virus test file, which public hash services all know.
+    "maltego.Hash": "44d88612fea8a8f36de82e1278abb02f",
 }
 
 # Per-transform input overrides, matched against the end of the transform id.
@@ -113,9 +124,18 @@ MISSING_SETTING_MARKERS = (
 # SKIP rather than FAIL: re-run the affected transform on its own to judge it.
 RATE_LIMIT_MARKERS = ("rate limited", "too many requests", "(429)")
 
+# A transform reporting one of these was refused because the account behind its key has
+# run out of credits: the SDK's IntegrationClient reports an upstream 402 as "payment
+# required / credits exhausted (402)". Like a rate limit, a fact about the account rather
+# than the code, so SKIP.
+QUOTA_MARKERS = ("(402)", "credits exhausted")
+
 # A transform reporting one of these ran correctly but had nothing to return for the
 # sample input. Distinct from a silent failure, which produces no message at all.
 NO_MATCH_MARKERS = (
+    # What every scaffolded transform reports when its upstream answers 404 (the
+    # generator's fetch in transformatron/scaffold/generator.py).
+    "has no record for the requested input",
     "no exact victim match",
     "no press coverage",
     "no leak site listing",
@@ -134,7 +154,7 @@ NO_MATCH_MARKERS = (
 # A transform reporting one of these rejected the sample input before making a request.
 # Distinct from a no-match: the transform is fine and the *sample* is unsuitable, which
 # happens when one entity type covers several input formats — a Phrase sample cannot be
-# both a search query and an opaque id. Reported SKIP with a pointer at TRANSFORM_SAMPLES.
+# both a search query and an opaque id. Reported SKIP with a pointer at the sample tables.
 INVALID_SAMPLE_MARKERS = ("invalid input",)
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
@@ -149,6 +169,15 @@ class Outcome:
     detail: str
 
 
+# The fix a transform with an empty output type needs. Only a missing return annotation
+# registers that way: a bare `-> list` does not register at all, because the SDK rejects
+# it while loading the module (blaming input_entity), so the server never starts.
+NO_OUTPUT_TYPE_DETAIL = (
+    "declares no output type, so the Maltego client cannot route its results — it has no "
+    "return annotation; add one naming the entity types, e.g. '-> list[Domain]'"
+)
+
+
 def _type_ids(spec: Any) -> list[str]:
     """Return the entity type ids from a discovery input/output spec."""
     if not isinstance(spec, dict):
@@ -157,23 +186,59 @@ def _type_ids(spec: Any) -> list[str]:
     return [str(t) for t in type_ids] if isinstance(type_ids, list) else []
 
 
-def _transform_sample(transform_id: str) -> str | None:
-    """Return the per-transform input override for `transform_id`, if one is defined."""
-    for suffix, value in TRANSFORM_SAMPLES.items():
+def load_transform_samples(transforms_dir: Path) -> dict[str, str]:
+    """Collect the ``{transform_id: input}`` maps from every ``samples.json`` under a tree.
+
+    The scaffolder records the input it saw in the cURL command or spec example there, so
+    a generated transform is exercised on a value its API is known to answer for, not on
+    a generic sample such as ``example`` that it has no record of. Files are read in path
+    order and the first file naming a transform id wins, so the result does not depend on
+    directory listing order. A file that cannot be used is reported and skipped: one bad
+    file should cost its own samples, not the whole gate.
+    """
+    samples: dict[str, str] = {}
+    for path in sorted(transforms_dir.rglob("samples.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            print(f"Ignoring {path}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(data, dict):
+            print(f"Ignoring {path}: expected an object of transform id to input", file=sys.stderr)
+            continue
+        for transform_id, value in data.items():
+            if isinstance(value, str) and value:
+                samples.setdefault(str(transform_id), value)
+    return samples
+
+
+def _sample_for(transform_id: str, samples: dict[str, str]) -> str | None:
+    """Return the sample keyed by `transform_id`'s last segment (or the full id), if any."""
+    for suffix, value in samples.items():
         if transform_id.endswith(f".{suffix}") or transform_id == suffix:
             return value
     return None
 
 
-def _pick_input(transform: dict[str, Any], override: str | None) -> tuple[str, str] | None:
-    """Return the (entity_type, value) to exercise a transform, or None if unknown."""
+def pick_input(
+    transform: dict[str, Any], override: str | None, file_samples: dict[str, str] | None = None
+) -> tuple[str, str] | None:
+    """Return the (entity_type, value) to exercise a transform, or None if unknown.
+
+    Precedence: an explicit ``--value``, then the transform's ``samples.json`` entry, then
+    ``TRANSFORM_SAMPLES``, then the ``SAMPLE_VALUES`` default for its input type.
+    """
     transform_id = str(transform.get("name", ""))
+    sample = (
+        override
+        if override is not None
+        else _sample_for(transform_id, file_samples or {})
+        or _sample_for(transform_id, TRANSFORM_SAMPLES)
+    )
     for type_id in _type_ids(transform.get("input")):
-        if override is not None:
-            return type_id, override
-        sample = _transform_sample(transform_id) or SAMPLE_VALUES.get(type_id)
-        if sample is not None:
-            return type_id, sample
+        value = sample if sample is not None else SAMPLE_VALUES.get(type_id)
+        if value is not None:
+            return type_id, value
     return None
 
 
@@ -183,25 +248,101 @@ def _matches(messages: list[str], markers: tuple[str, ...]) -> bool:
     return any(marker in joined for marker in markers)
 
 
+def classify_run(transform_id: str, entity_type: str, value: str, result: RunResult) -> Outcome:
+    """Classify a finished run of `transform_id` on `entity_type`=`value`."""
+    messages = "; ".join(result.messages) if result.messages else "no messages"
+    if not result.succeeded:
+        return Outcome(transform_id, FAIL, f"state {result.state} ({messages})")
+    if result.entities:
+        return Outcome(transform_id, PASS, f"{len(result.entities)} entities from {value}")
+
+    # An unconfigured credential is a gap in this run, not a defect in the
+    # transform. Reporting it as FAIL would train people to ignore failures.
+    if _matches(result.messages, MISSING_SETTING_MARKERS):
+        return Outcome(
+            transform_id,
+            SKIP,
+            f"needs a credential — pass it with --setting to exercise this ({messages})",
+        )
+    # Throttled before it could answer. Running every transform back to back trips
+    # free-tier quotas that interactive use never would, so this is a fact about
+    # the run, not the code.
+    if _matches(result.messages, RATE_LIMIT_MARKERS):
+        return Outcome(
+            transform_id,
+            SKIP,
+            f"upstream rate limit ({messages}) — re-run this transform on its own to judge it",
+        )
+    if _matches(result.messages, QUOTA_MARKERS):
+        return Outcome(
+            transform_id,
+            SKIP,
+            f"upstream credits exhausted ({messages}) — top up or use another key to judge it",
+        )
+    # The transform rejected the sample before calling upstream. The code is fine;
+    # the sample does not fit this transform's input format.
+    if _matches(result.messages, INVALID_SAMPLE_MARKERS):
+        return Outcome(
+            transform_id,
+            SKIP,
+            f"sample input does not fit this transform ({messages}) — "
+            f"add a samples.json or TRANSFORM_SAMPLES entry to exercise it",
+        )
+    # The transform ran and said, explicitly, that this input has no results.
+    # That is honest behaviour, not the silent empty return this gate hunts for.
+    if _matches(result.messages, NO_MATCH_MARKERS):
+        return Outcome(
+            transform_id,
+            SKIP,
+            f"no upstream match for the sample input ({messages}) — "
+            f"add a samples.json or TRANSFORM_SAMPLES entry to exercise it",
+        )
+    # A run that logged an error still ends COMPLETED: a transform reporting an upstream
+    # 403 or 500 through context.log.fatal returns normally. The error is the finding.
+    errors = [
+        text
+        for text, level in zip(result.messages, result.message_levels, strict=False)
+        if level == "ERROR"
+    ]
+    if errors:
+        return Outcome(
+            transform_id,
+            FAIL,
+            f"error with no entities for {entity_type}={value}: {'; '.join(errors)}",
+        )
+    if not result.messages:
+        # Nothing at all: the silent failure this gate exists for. The SDK drops a
+        # MaltegoGraph returned from an async transform without a word.
+        return Outcome(
+            transform_id,
+            FAIL,
+            f"reported {result.state} but returned no entities and no message for "
+            f"{entity_type}={value} — if it returns a MaltegoGraph, return a list instead",
+        )
+    return Outcome(
+        transform_id,
+        FAIL,
+        f"reported {result.state} but returned no entities for {entity_type}={value} "
+        f"({messages}) — no message names an error or a known no-match, so check how the "
+        "response is mapped",
+    )
+
+
 async def check_transform(
     client: TransformClient,
     transform: dict[str, Any],
     override: str | None,
     timeout: float,
     settings: dict[str, str] | None = None,
+    file_samples: dict[str, str] | None = None,
 ) -> Outcome:
     """Run one transform and classify the result."""
     transform_id = str(transform.get("name", "<unnamed>"))
 
     if not _type_ids(transform.get("output")):
-        return Outcome(
-            transform_id,
-            FAIL,
-            "declares no output type — add a typed return annotation (a bare '-> list' "
-            "advertises nothing and breaks client routing)",
-        )
+        return Outcome(transform_id, FAIL, NO_OUTPUT_TYPE_DETAIL)
 
-    chosen = _pick_input(transform, override)
+    chosen = pick_input(transform, override, file_samples)
     if chosen is None:
         inputs = ", ".join(_type_ids(transform.get("input"))) or "none declared"
         return Outcome(transform_id, SKIP, f"no sample value for input type ({inputs})")
@@ -211,53 +352,7 @@ async def check_transform(
         result = await client.run_transform(transform_id, entity_type, value, settings, timeout)
     except TransformServerError as exc:
         return Outcome(transform_id, FAIL, f"run failed: {exc}")
-
-    messages = "; ".join(result.messages) if result.messages else "no messages"
-    if not result.succeeded:
-        return Outcome(transform_id, FAIL, f"state {result.state} ({messages})")
-    if not result.entities:
-        # An unconfigured credential is a gap in this run, not a defect in the
-        # transform. Reporting it as FAIL would train people to ignore failures.
-        if _matches(result.messages, MISSING_SETTING_MARKERS):
-            return Outcome(
-                transform_id,
-                SKIP,
-                f"needs a credential — pass it with --setting to exercise this ({messages})",
-            )
-        # Throttled before it could answer. Running every transform back to back trips
-        # free-tier quotas that interactive use never would, so this is a fact about
-        # the run, not the code.
-        if _matches(result.messages, RATE_LIMIT_MARKERS):
-            return Outcome(
-                transform_id,
-                SKIP,
-                f"upstream rate limit ({messages}) — re-run this transform on its own to judge it",
-            )
-        # The transform rejected the sample before calling upstream. The code is fine;
-        # the sample does not fit this transform's input format.
-        if _matches(result.messages, INVALID_SAMPLE_MARKERS):
-            return Outcome(
-                transform_id,
-                SKIP,
-                f"sample input does not fit this transform ({messages}) — "
-                f"add a TRANSFORM_SAMPLES entry to exercise it",
-            )
-        # The transform ran and said, explicitly, that this input has no results.
-        # That is honest behaviour, not the silent empty return this gate hunts for.
-        if _matches(result.messages, NO_MATCH_MARKERS):
-            return Outcome(
-                transform_id,
-                SKIP,
-                f"no upstream match for the sample input ({messages}) — "
-                f"add a TRANSFORM_SAMPLES entry to exercise it",
-            )
-        return Outcome(
-            transform_id,
-            FAIL,
-            f"reported {result.state} but returned no entities for {entity_type}={value} "
-            f"({messages}) — if it returns a MaltegoGraph, return a list instead",
-        )
-    return Outcome(transform_id, PASS, f"{len(result.entities)} entities from {value}")
+    return classify_run(transform_id, entity_type, value, result)
 
 
 def parse_settings(pairs: list[str] | None) -> dict[str, str] | None:
@@ -311,8 +406,12 @@ async def run(
         print("The server advertises no transforms — nothing to check.")
         return 0
 
+    file_samples = load_transform_samples(config.project_dir / "transforms")
     print(f"Checking {len(transforms)} transforms against {config.base_url}\n")
-    outcomes = [await check_transform(client, t, override, timeout, settings) for t in transforms]
+    outcomes = [
+        await check_transform(client, t, override, timeout, settings, file_samples)
+        for t in transforms
+    ]
 
     for outcome in outcomes:
         print(f"  {outcome.status:<4} {outcome.transform_id}\n       {outcome.detail}")
