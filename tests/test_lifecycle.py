@@ -7,7 +7,8 @@ import os
 import socket
 import subprocess
 import sys
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 
 import httpx
 import pytest
@@ -190,6 +191,152 @@ def test_stop_never_signals_a_foreign_process(
 
     assert lifecycle.stop(config) == "Server is not running."
     assert sent == []
+
+
+@pytest.fixture
+def stalling_server(
+    config: TransformatronConfig, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[list[str]], subprocess.Popen]]:
+    """Start recorded servers that log given lines when asked to stop, then hang.
+
+    Each writes to server.log as the real server does, so ``stop`` has to find the cause
+    in what was appended after its SIGTERM. Any child a failed test leaves running is
+    killed at teardown, since it ignores SIGTERM by design.
+    """
+    started: list[subprocess.Popen] = []
+    monkeypatch.setattr(lifecycle, "SHUTDOWN_TIMEOUT", 0.5)
+
+    def start(on_sigterm: list[str]) -> subprocess.Popen:
+        config.entrypoint.write_text(
+            "import signal, time\n"
+            f"LINES = {on_sigterm!r}\n"
+            "def on_term(*_):\n"
+            "    for line in LINES:\n"
+            "        print(f'INFO     | uvicorn | {line}', flush=True)\n"
+            "signal.signal(signal.SIGTERM, on_term)\n"
+            "print('ready', flush=True)\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        offset = config.log_file.stat().st_size if config.log_file.exists() else 0
+        with config.log_file.open("ab") as log:
+            process = subprocess.Popen(
+                [sys.executable, config.entrypoint.name],
+                cwd=config.project_dir,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        started.append(process)
+        # The handler must be installed before stop signals, or SIGTERM just ends the child.
+        deadline = time.monotonic() + 10
+        while b"ready" not in config.log_file.read_bytes()[offset:]:
+            assert process.poll() is None, "the stalling server exited before it was ready"
+            assert time.monotonic() < deadline, "the stalling server never became ready"
+            time.sleep(0.02)
+        monkeypatch.setitem(lifecycle._OWNED, process.pid, process)
+        config.pid_file.write_text(str(process.pid))
+        return process
+
+    yield start
+    for process in started:
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize(
+    ("scheme", "on_sigterm", "cause"),
+    [
+        (
+            "https",
+            ["Shutting down", "Waiting for connections to close. (CTRL+C to force quit)"],
+            "Open client connections held it up",
+        ),
+        ("https", ["Shutting down"], "never finished its TLS handshake"),
+        (
+            "http",
+            ["Shutting down", "Waiting for application shutdown."],
+            "blocking the runner thread",
+        ),
+        # Connections drained, then the lifespan stalled: the runner thread is to blame.
+        (
+            "https",
+            [
+                "Shutting down",
+                "Waiting for connections to close. (CTRL+C to force quit)",
+                "Waiting for application shutdown.",
+            ],
+            "blocking the runner thread",
+        ),
+        # The lifespan finished, so neither connections nor a transform are to blame.
+        (
+            "https",
+            [
+                "Shutting down",
+                "Waiting for connections to close. (CTRL+C to force quit)",
+                "Waiting for application shutdown.",
+                "Application shutdown complete.",
+            ],
+            "shut down but the process did not exit",
+        ),
+        # Plain-HTTP sockets close at once, so a silent stall there is not a handshake.
+        ("http", ["Shutting down"], "Shutdown stalled with no further log line"),
+    ],
+)
+def test_killed_stop_names_the_cause_from_the_log(
+    config: TransformatronConfig,
+    stalling_server: Callable[[list[str]], subprocess.Popen],
+    scheme: str,
+    on_sigterm: list[str],
+    cause: str,
+) -> None:
+    """A kill must say what held shutdown up, not read like a crash that lost work."""
+    process = stalling_server(on_sigterm)
+    config.scheme_file.write_text(scheme)
+
+    message = lifecycle.stop(config)
+
+    assert process.poll() is not None, "the stalled server must still be killed"
+    assert message.startswith(f"Server did not exit within 0.5s and was killed (pid {process.pid})")
+    assert cause in message
+    assert "Nothing was lost" in message
+    assert "\n" not in message
+    assert not config.pid_file.exists()
+
+
+def test_killed_stop_ignores_log_lines_from_earlier_runs(
+    config: TransformatronConfig, stalling_server: Callable[[list[str]], subprocess.Popen]
+) -> None:
+    """An old run's shutdown lines must not be blamed for this one's stall."""
+    config.state_dir.mkdir(parents=True)
+    config.log_file.write_text(
+        "INFO     | uvicorn | Shutting down\n"
+        "INFO     | uvicorn | Waiting for application shutdown.\n"
+    )
+    process = stalling_server([])
+
+    message = lifecycle.stop(config)
+
+    assert process.poll() is not None
+    assert "logged nothing after SIGTERM" in message
+    assert "runner thread" not in message
+
+
+def test_restart_reports_why_the_old_server_had_to_be_killed(
+    config: TransformatronConfig,
+    stalling_server: Callable[[list[str]], subprocess.Popen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restart is the reload path agents use most; a kill there must not pass unexplained."""
+    process = stalling_server(["Shutting down", "Waiting for application shutdown."])
+    config.scheme_file.write_text("http")
+    _record_restart_scheme(config, monkeypatch)
+
+    status = lifecycle.restart(config)
+
+    assert process.poll() is not None
+    assert "blocking the runner thread" in status.detail
+    assert status.detail.endswith("started")
 
 
 def test_build_server_env_pins_host_port_and_scheme(config: TransformatronConfig) -> None:

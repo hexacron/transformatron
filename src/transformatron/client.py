@@ -8,6 +8,7 @@ Route and payload shapes are taken from the SDK's own protocol definitions
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,9 +27,48 @@ TERMINAL_STATES = SUCCESS_STATES | FAILURE_STATES
 DEFAULT_RUN_TIMEOUT = 60.0
 POLL_INTERVAL = 0.5
 
+# A status message's ``type``, per ``StatusMessage`` in
+# maltego/protocol/v3/execution/transform_run.py:42-43, is one of INFO, WARNING, ERROR, or
+# DEBUG, defaulting to INFO. maltego/model/event.py:60-65 maps the transform's
+# ``context.log`` calls onto it (maltego/model/context.py:161-171): ``inform`` -> INFO,
+# ``partial`` -> WARNING, ``fatal`` -> ERROR, ``debug`` -> DEBUG. A raised MaltegoException
+# is emitted as a FatalError, so ERROR too (maltego/runner/transform_result_set.py:123-124).
+# The level is what tells an upstream 403 logged with ``fatal`` apart from an informational
+# "no record", since both runs still end COMPLETED.
+DEFAULT_MESSAGE_LEVEL = "INFO"
+
 
 class TransformServerError(RuntimeError):
     """Raised when the transform server is unreachable or returns an error."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        # The HTTP status the server answered with; None when no answer arrived.
+        self.status_code = status_code
+
+
+class TransformNotFoundError(TransformServerError):
+    """Raised when the server has no transform with the requested id.
+
+    A separate type so a front end can tell the caller how to find the right id: the most
+    common cause is a short id without the namespace, or a transform added since the server
+    started.
+    """
+
+
+async def _not_found_as_unknown_transform(request: Coroutine[Any, Any, Any]) -> Any:
+    """Await a request on a transform route, raising a 404 as TransformNotFoundError.
+
+    The transform detail and run-start routes answer 404 only for an unknown transform id
+    (maltego/server/v3/__init__.py:985-989 and :1343-1347); the run-results routes answer
+    404 for an unknown run, which is why this is not applied in ``_request`` itself.
+    """
+    try:
+        return await request
+    except TransformServerError as exc:
+        if exc.status_code == 404:
+            raise TransformNotFoundError(str(exc), exc.status_code) from exc
+        raise
 
 
 @dataclass
@@ -41,6 +81,8 @@ class RunResult:
         entities: Entities produced by the transform.
         links: Links produced by the transform.
         messages: Status messages emitted during the run.
+        message_levels: Severity of each entry in ``messages``, index for index: INFO,
+            WARNING, ERROR, or DEBUG.
     """
 
     run_id: str
@@ -48,10 +90,16 @@ class RunResult:
     entities: list[dict[str, Any]] = field(default_factory=list)
     links: list[dict[str, Any]] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    message_levels: list[str] = field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:
         return self.state in SUCCESS_STATES
+
+    def add_message(self, text: str, level: str = DEFAULT_MESSAGE_LEVEL) -> None:
+        """Record one status message, keeping ``message_levels`` aligned with ``messages``."""
+        self.messages.append(text)
+        self.message_levels.append(level)
 
 
 def build_run_request(
@@ -116,9 +164,11 @@ def collect_events(events: list[dict[str, Any]], result: RunResult) -> None:
         elif input_type == "LINK" and "link" in data:
             _apply_event(result.links, event_type, data["link"])
         elif input_type == "STATUS_MESSAGE" and event_type == "ADD":
-            text = data.get("statusMessage", {}).get("text") or data.get("text")
+            status = data.get("statusMessage") or {}
+            text = status.get("text") or data.get("text")
             if text:
-                result.messages.append(str(text))
+                level = str(status.get("type") or DEFAULT_MESSAGE_LEVEL).upper()
+                result.add_message(str(text), level)
 
 
 def _apply_event(items: list[dict[str, Any]], event_type: str, item: dict[str, Any]) -> None:
@@ -182,7 +232,8 @@ class TransformClient:
             ) from exc
         if response.status_code >= 400:
             raise TransformServerError(
-                f"{method} {url} failed with HTTP {response.status_code}: {response.text[:400]}"
+                f"{method} {url} failed with HTTP {response.status_code}: {response.text[:400]}",
+                response.status_code,
             )
         if not response.content:
             return None
@@ -206,7 +257,9 @@ class TransformClient:
 
     async def get_transform(self, transform_id: str) -> Any:
         """Return the detail document for a single transform."""
-        return await self._request("GET", f"transforms/{transform_id}")
+        return await _not_found_as_unknown_transform(
+            self._request("GET", f"transforms/{transform_id}")
+        )
 
     async def list_entities(self) -> list[dict[str, Any]]:
         """Return every entity schema the server advertises."""
@@ -238,10 +291,13 @@ class TransformClient:
             The collected entities, links, and messages for the run.
 
         Raises:
+            TransformNotFoundError: If the server has no transform with this id.
             TransformServerError: If the server is unreachable or returns no run id.
         """
         body = build_run_request(entity_type, entity_value, settings)
-        started = await self._request("POST", f"transforms/{transform_id}/run", json=body)
+        started = await _not_found_as_unknown_transform(
+            self._request("POST", f"transforms/{transform_id}/run", json=body)
+        )
         run_id = (started or {}).get("result", {}).get("runId")
         if not run_id:
             raise TransformServerError(
@@ -269,6 +325,16 @@ class TransformClient:
             seen += len(events)
 
             if result.state in TERMINAL_STATES:
+                if result.state in FAILURE_STATES:
+                    # The SDK marks a run FAILED before it logs the traceback and pushes the
+                    # message saying why (maltego/runner/transform_execution_context.py:
+                    # 409-412 sets the state, then __handle_task_exception at :343-371), and
+                    # the results endpoint is served from another thread meanwhile. A poll
+                    # landing in between sees FAILED and no message, so read once more after
+                    # a pause to collect what followed.
+                    await asyncio.sleep(POLL_INTERVAL)
+                    late = await self._fetch_events_from(transform_id, run_id, seen)
+                    collect_events(late.get("events", []) or [], result)
                 return result
 
             if loop.time() >= deadline:
@@ -277,8 +343,8 @@ class TransformClient:
                 with suppress(TransformServerError):
                     await self.cancel_run(transform_id, run_id)
                 result.state = "TIMED_OUT"
-                result.messages.append(
-                    f"Run exceeded the {timeout:g}s client timeout and was cancelled."
+                result.add_message(
+                    f"Run exceeded the {timeout:g}s client timeout and was cancelled.", "ERROR"
                 )
                 return result
 

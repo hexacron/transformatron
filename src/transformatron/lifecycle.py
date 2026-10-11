@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -399,26 +399,109 @@ def _terminate(pid: int) -> bool:
     return True
 
 
+# uvicorn logs these in order while it shuts down (uvicorn/server.py Server.shutdown and
+# uvicorn/lifespan/on.py; unchanged from 0.35 to 0.54). The furthest one reached names
+# the stage that was still waiting when the server had to be killed.
+_SHUTDOWN_STARTED = "Shutting down"
+_WAITING_FOR_CONNECTIONS = "Waiting for connections to close"
+_WAITING_FOR_APPLICATION = "Waiting for application shutdown."
+_APPLICATION_SHUTDOWN_COMPLETE = "Application shutdown complete."
+
+
+def _log_size(config: TransformatronConfig) -> int:
+    """Return the current size of the server log, so later reads see only new lines."""
+    try:
+        return config.log_file.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_log_from(config: TransformatronConfig, offset: int) -> str:
+    """Return what the server logged after byte ``offset`` of its log."""
+    try:
+        with config.log_file.open("rb") as handle:
+            handle.seek(offset)
+            return handle.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _shutdown_stall_cause(logged: str, https: bool) -> str:
+    """Name what held up a shutdown, from the lines logged after SIGTERM.
+
+    A bare "was killed" reads like a crash and invites hunting for lost work. Each
+    known cause leaves its own trace in the log, so the message can say which one it
+    was and what, if anything, to change.
+    """
+    if _APPLICATION_SHUTDOWN_COMPLETE in logged:
+        return (
+            "The application shut down but the process did not exit; check server.log for "
+            "what was still running."
+        )
+    # Checked before the connection wait: the lifespan only starts once connections are
+    # done, so reaching it means the connections were not what blocked.
+    if _WAITING_FOR_APPLICATION in logged:
+        return (
+            "A transform was blocking the runner thread, and the SDK waits for it without a "
+            "limit; check server.log for the run in progress, and use async I/O in transforms "
+            "(never requests, sync httpx or time.sleep)."
+        )
+    if _WAITING_FOR_CONNECTIONS in logged:
+        return (
+            "Open client connections held it up; an HTTPS keep-alive client such as Maltego "
+            "Desktop can hold shutdown for up to 30s while TLS closes."
+        )
+    if _SHUTDOWN_STARTED in logged and https:
+        # uvicorn tracks a connection only once its TLS handshake is done, so one stuck
+        # mid-handshake leaves no log line, yet asyncio waits up to 60s for it.
+        return (
+            "A client connection that never finished its TLS handshake held it up; the "
+            "server waits up to 60s for one and logs nothing about it."
+        )
+    if _SHUTDOWN_STARTED in logged:
+        return "Shutdown stalled with no further log line; check server.log."
+    return "The server logged nothing after SIGTERM; check server.log."
+
+
 def stop(config: TransformatronConfig) -> str:
     """Terminate the server, escalating to SIGKILL if it does not exit.
 
-    Only a pid that :func:`read_pid` confirms is our server is ever signalled.
+    Only a pid that :func:`read_pid` confirms is our server is ever signalled. When the
+    server has to be killed, the message names the cause found in the log lines written
+    since SIGTERM; earlier lines belong to previous runs and would mislead.
     """
+    return _stop(config)[0]
+
+
+def _stop(config: TransformatronConfig) -> tuple[str, bool]:
+    """Stop the server and return the message and whether it had to be killed."""
     pid = read_pid(config)
     if pid is None:
-        return "Server is not running."
+        return "Server is not running.", False
 
+    https = read_scheme(config) == "https"
+    log_offset = _log_size(config)
     killed = _terminate(pid)
     _clear_state(config)
     if killed:
-        return f"Server did not exit within {SHUTDOWN_TIMEOUT:g}s and was killed (pid {pid})."
-    return f"Server stopped (pid {pid})."
+        cause = _shutdown_stall_cause(_read_log_from(config, log_offset), https)
+        # The SDK's shutdown only stops runner threads and closes its auth client, and
+        # middleware.py has no flush hooks, so a kill skips nothing worth keeping.
+        message = (
+            f"Server did not exit within {SHUTDOWN_TIMEOUT:g}s and was killed (pid {pid}). "
+            f"{cause} Nothing was lost: the server keeps no state that a clean shutdown "
+            "would have saved."
+        )
+        return message, True
+    return f"Server stopped (pid {pid}).", False
 
 
 def restart(config: TransformatronConfig, ssl: bool | None = None) -> ServerStatus:
     """Stop the server if running, then start it again.
 
-    This is the reload path after adding or editing a transform module.
+    This is the reload path after adding or editing a transform module, so a stop that
+    had to kill the server is reported with its cause ahead of the start: otherwise a
+    transform blocking its runner thread shows up only as an unexplained 10s pause.
 
     Args:
         ssl: Serve over HTTPS. When ``None`` the scheme the server is currently
@@ -431,5 +514,8 @@ def restart(config: TransformatronConfig, ssl: bool | None = None) -> ServerStat
     """
     if ssl is None:
         ssl = read_scheme(config) == "https"
-    stop(config)
-    return start(config, ssl=ssl)
+    stopped, killed = _stop(config)
+    status = start(config, ssl=ssl)
+    if killed:
+        return replace(status, detail=f"{stopped}\n{status.detail}")
+    return status
