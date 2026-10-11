@@ -12,10 +12,12 @@ server lifecycle and the transform execution cycle.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
-from typing import Concatenate
+from typing import Any, Concatenate
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from transformatron import operations
 from transformatron.config import ConfigError, TransformatronConfig, load_config
@@ -29,11 +31,27 @@ server = MCPServer(
     ),
 )
 
+log = logging.getLogger(__name__)
+
 
 # Config is loaded on every call, not once at import, for the same reason the CLI loads it
 # per command: an edit to transformatron.toml must apply to the next tool call without
 # restarting the MCP client, and a typo in the file must come back to the agent as a
 # message it can act on rather than stopping this server from starting at all.
+
+
+def _crash(exc: Exception) -> ToolError:
+    """Return a ToolError naming an operation's unexpected exception, logging its traceback.
+
+    Operations report every failure a caller can act on as text, so an exception reaching
+    here is a bug. Since mcp 2.1 an uncaught one reaches the agent only as "Error
+    executing tool <name>", with the cause kept on the server (mcp/server/mcpserver/tools/
+    base.py: "A crash: the exception's own text stays on the server"). A ToolError is
+    passed through with its message, so the agent can see what broke and report it. The
+    traceback still goes to this server's stderr, where a ToolError alone would not put it.
+    """
+    log.exception("Tool operation raised unexpectedly")
+    return ToolError(f"{type(exc).__name__}: {exc}")
 
 
 async def _blocking[**P](
@@ -51,8 +69,12 @@ async def _blocking[**P](
         config = load_config()
     except ConfigError as exc:
         return f"Failed: {exc}"
+    try:
+        output = await asyncio.to_thread(operation, config, *args, **kwargs)
+    except Exception as exc:
+        raise _crash(exc) from exc
     # str() drops the operations.Failure subtype: MCP tools return plain text.
-    return str(await asyncio.to_thread(operation, config, *args, **kwargs))
+    return str(output)
 
 
 async def _async[**P](
@@ -65,7 +87,11 @@ async def _async[**P](
         config = load_config()
     except ConfigError as exc:
         return f"Failed: {exc}"
-    return str(await operation(config, *args, **kwargs))
+    try:
+        output = await operation(config, *args, **kwargs)
+    except Exception as exc:
+        raise _crash(exc) from exc
+    return str(output)
 
 
 @server.tool()
@@ -146,11 +172,21 @@ async def run_transform(
     entity_value: str,
     settings: dict[str, str] | None = None,
     timeout: float = 60.0,
+    full: bool = False,
 ) -> str:
     """Run a transform against one input entity and return its results.
 
-    Check the reported entity count: a transform can report success while
-    producing nothing. See docs/transform-authoring.md.
+    The output starts with the run state, then each status message prefixed with its
+    severity ([INFO], [WARNING], [ERROR], [DEBUG]), then the entity count and the number
+    of distinct (type, value) pairs, one line per entity:
+    `type  value  {property=value, ...}  [link label]`, and the link count. A run that
+    FAILED also shows the last Python traceback from the server log.
+
+    Check the entity count and the message severities: a transform can report success
+    while producing nothing, and an upstream 403 or 500 logged as [ERROR] still ends the
+    run in a success state; a run like that with no entities gets a Warning line under
+    the state. An unknown transform id comes back with how to find the right one. See
+    docs/transform-authoring.md.
 
     Args:
         transform_id: Fully qualified transform name from list_transforms.
@@ -158,9 +194,18 @@ async def run_transform(
         entity_value: Value carried by the input entity.
         settings: Optional transform settings, keyed by setting name.
         timeout: Seconds to wait before cancelling the run.
+        full: Return every entity and link as the full JSON the server sent instead of
+            one line each. Use it when a property, display field, or overlay that the
+            summary cuts short matters.
     """
     return await _async(
-        operations.run_transform, transform_id, entity_type, entity_value, settings, timeout
+        operations.run_transform,
+        transform_id,
+        entity_type,
+        entity_value,
+        settings,
+        timeout,
+        full=full,
     )
 
 
@@ -184,21 +229,67 @@ async def generate_certs(force: bool = False) -> str:
 async def scaffold_transform(
     service: str | None = None,
     curl: str | None = None,
-    openapi: str | None = None,
-    sample_response: str | None = None,
+    # Typed to accept a parsed document as well as text: the MCP server decodes any string
+    # argument holding JSON unless the parameter is exactly `str`
+    # (mcp/server/mcpserver/utilities/func_metadata.py, pre_parse_json), so a sample or spec
+    # passed as a JSON string arrives as a dict or list and a plain `str | None` rejected it.
+    openapi: str | dict[str, Any] | None = None,
+    sample_response: str | dict[str, Any] | list[Any] | None = None,
     operation_ids: list[str] | None = None,
     force: bool = False,
+    name: str | None = None,
+    records: str | None = None,
+    mappings: list[str] | None = None,
+    dry_run: bool = False,
+    # Not exactly `str`, so the JSON pre-parse noted above applies, but it leaves a value
+    # that decodes to a number or string alone (pre_parse_json skips str/int/float), so an
+    # id like "1" or a hash arrives as the text sent.
+    sample_input: str | None = None,
+    primary: str | None = None,
 ) -> str:
     """Scaffold a new Maltego transform module from a cURL command or OpenAPI specification.
+
+    The output lists each transform by the id the server registers it under, its sample
+    input, a ready-made run command, and a field inventory: every leaf path seen in the
+    sample response or schema, its sample value, and what happened to it (mapped to an
+    entity, attached as a property, or dropped and why). Read the inventory and the notes:
+    data an investigator needs is often nested deeper than the scaffolder follows by
+    default. Preview with dry_run=True, adjust records/mappings/primary until the inventory
+    maps what matters, then call again without dry_run. Restart the server, then call
+    run_transform with the transform id exactly as listed (it includes the namespace).
 
     Args:
         service: Optional service name slug (e.g. 'greynoise', 'threatfox').
         curl: A full cURL command string demonstrating an API request.
-        openapi: An OpenAPI/Swagger JSON spec: a URL, a file path, or the document itself.
-        sample_response: Sample JSON response for a cURL command, to infer output fields.
+        openapi: An OpenAPI/Swagger spec in JSON or YAML: a URL, a file path, or the
+            document itself (as text or as an object). Use list_operations first to
+            pick operation_ids.
+        sample_response: A real JSON response (as text or as the parsed value), to map
+            outputs from. Works with curl, and with openapi when exactly one operation
+            is scaffolded (name it in operation_ids); without it a spec with no response
+            schema maps nothing.
         operation_ids: OpenAPI operation ids to scaffold. Without it every GET operation is
             scaffolded; POST operations are only scaffolded when named here.
-        force: Overwrite an existing service directory.
+        force: Replace an existing service: its whole directory and its project.py imports.
+        name: Transform name for a curl scaffold (default '<service>_lookup'), so one
+            service can grow endpoint by endpoint.
+        records: Dotted path to the list of records in the response, e.g. 'data' or
+            'containers.cna.references'. Each element becomes one record to map.
+        mappings: Per-field overrides as 'dotted.path[].field=EntityType', e.g.
+            'containers.cna.affected[].vendor=Company'. EntityType 'Property' attaches
+            the field to the record's entity as a property; 'Drop' ignores it.
+        dry_run: Parse and report the plan (transforms, field inventory, notes, auth,
+            and the files that would be written) without writing anything.
+        sample_input: An input value the API answers for, e.g. the hash or id the
+            sample_response came from. The generated transform skips the input when the
+            response echoes it back (so the other fields enrich the input instead of a copy
+            of it), and samples.json records it so the smoke test sends a value the
+            endpoint accepts. A curl scaffold defaults to the value in the request; give it
+            for an openapi scaffold, which otherwise only has the spec's example, if any.
+        primary: Path of the field to use as each record's primary entity, the one every
+            other field attaches to as a property, written like a mappings path (e.g.
+            'SHA-1' or 'hits.hits[]._id'). It must map to an entity type; the error names
+            the valid candidates.
     """
     return await _blocking(
         operations.scaffold,
@@ -208,7 +299,47 @@ async def scaffold_transform(
         sample_response=sample_response,
         operations=operation_ids,
         force=force,
+        name=name,
+        records=records,
+        mappings=mappings,
+        dry_run=dry_run,
+        sample_input=sample_input,
+        primary=primary,
     )
+
+
+@server.tool()
+async def list_operations(openapi: str, service: str | None = None) -> str:
+    """List the operations in an OpenAPI spec and what scaffolding each would produce.
+
+    One row per operation: HTTP method, path, operation id (pass it to
+    scaffold_transform's operation_ids), the transform id it would get, the inferred
+    input entity, whether the spec has a response schema to map outputs from, and why
+    an operation would be skipped. Nothing is written.
+
+    Args:
+        openapi: An OpenAPI/Swagger spec in JSON or YAML: a URL, a file path, or the
+            document itself.
+        service: The service name you will scaffold under, so the transform ids shown
+            match the ones scaffold_transform generates.
+    """
+    return await _blocking(operations.list_operations, openapi, service=service)
+
+
+@server.tool()
+async def remove_scaffold(service: str) -> str:
+    """Delete a scaffolded service directory and its imports in project.py.
+
+    Use this to undo a scaffold. Deleting server/transforms/<service>/ by hand leaves
+    its imports behind, and the server then fails to start. Restart the server
+    afterwards. Only services the scaffolder generated are removed: a hand-written
+    service (its api.py lacks the scaffold's generated marker) is refused, and the
+    output says so.
+
+    Args:
+        service: Service name slug, the directory name under server/transforms/.
+    """
+    return await _blocking(operations.remove_scaffold, service)
 
 
 def main() -> None:

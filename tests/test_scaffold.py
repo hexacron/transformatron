@@ -12,21 +12,37 @@ import pytest
 from transformatron import operations
 from transformatron.config import TransformatronConfig
 from transformatron.scaffold import (
+    EntityField,
+    PropertyField,
+    RecordMapping,
     ScaffoldServiceConfig,
     ScaffoldTransformConfig,
     generate_service_code,
     inject_project_import,
+    list_openapi_operations,
+    load_spec,
     parse_curl_command,
     parse_openapi_spec,
+    planned_scaffold_paths,
+    remove_scaffold,
     write_scaffold,
 )
 from transformatron.scaffold.generator import generate_api_module, generate_transform_module
 from transformatron.scaffold.schema import (
-    OutputFieldMapping,
     infer_input_entity,
     infer_output_entity,
     qualified_entity_type,
 )
+
+
+def _entities_mapping(*types: str) -> RecordMapping:
+    """Return a mapping emitting one entity per type, plus a property, for code-shape tests."""
+    fields = [EntityField(t, (f"f{i}",), f"f{i}") for i, t in enumerate(types)]
+    return RecordMapping(
+        primary=fields[0] if fields else None,
+        entities=fields[1:],
+        properties=[PropertyField("score", ("score",), "Score")] if fields else [],
+    )
 
 
 def test_infer_input_entity() -> None:
@@ -42,27 +58,58 @@ def test_infer_input_entity() -> None:
     assert infer_input_entity("custom_param")[0] == "Phrase"
 
 
-def test_infer_output_entity() -> None:
-    asn_mapping = infer_output_entity("asn")
-    assert asn_mapping.entity_type == "AS"
-    assert asn_mapping.strip_prefix == "AS"
+@pytest.mark.parametrize(
+    ("name", "sample", "expected"),
+    [
+        ("domainName", None, "Domain"),
+        ("ip-address", None, "IPv4Address"),
+        ("emailAddress", None, "EmailAddress"),
+        ("cveId", None, "CVE"),
+        ("file_sha256", None, "Hash"),
+        ("vulnerability_id", "CVE-2021-44228", "CVE"),
+        # A vulnerability id that is a GHSA advisory is not a CVE.
+        ("vulnerability_id", "GHSA-jfh8-c2jp-5v3q", "Phrase"),
+    ],
+)
+def test_input_names_match_on_their_words(name: str, sample: str | None, expected: str) -> None:
+    """camelCase, kebab-case and snake_case parameter names are recognised alike."""
+    assert infer_input_entity(name, sample)[0] == expected
 
-    country_mapping = infer_output_entity("country_code")
-    assert country_mapping.entity_type == "Country"
 
-    isp_mapping = infer_output_entity("as_name")
-    assert isp_mapping.entity_type == "ISP"
-
-    city_mapping = infer_output_entity("city")
-    assert city_mapping.entity_type == "City"
-
-    cve_mapping = infer_output_entity("cves", sample_val=["CVE-2024-1234"])
-    assert cve_mapping.entity_type == "CVE"
-    assert cve_mapping.is_list is True
-
-    phrase_mapping = infer_output_entity("reputation_score")
-    assert phrase_mapping.entity_type == "Phrase"
-    assert phrase_mapping.label_prefix == "Reputation Score: "
+@pytest.mark.parametrize(
+    ("name", "sample", "expected"),
+    [
+        ("asn", "AS15169", "AS"),
+        ("asNumber", 15169, "AS"),
+        ("country_code", "US", "Country"),
+        ("as_name", "Google", "ISP"),
+        ("city", "Paris", "City"),
+        ("cves", "CVE-2024-1234", "CVE"),
+        ("cveId", "CVE-2024-1234", "CVE"),
+        ("domainName", "example.com", "Domain"),
+        ("emailAddress", "a@example.com", "EmailAddress"),
+        ("ip-address", "192.0.2.1", "IPv4Address"),
+        ("cert_sha256", "ab" * 32, "Hash"),
+        # A vulnerability id is a CVE when its value is one.
+        ("vulnerability_id", "CVE-2021-44228", "CVE"),
+        # A digest is recognised by value whatever the key...
+        ("fingerprint", "0123456789abcdef" * 4, "Hash"),
+        # ...but a hex identifier or serial number is not a hash.
+        ("serial_number", "0123456789abcdef" * 2, "Phrase"),
+        ("request_id", "0123456789abcdef" * 2, "Phrase"),
+        # A lifecycle state is not a place; a two-letter state code is.
+        ("state", "PUBLISHED", "Phrase"),
+        ("state", "CA", "Location"),
+        # A certificate issuer's distinguished name is not a person.
+        ("name", "C=US, O=GoDaddy.com, CN=Go Daddy Secure CA", "Phrase"),
+        ("name", "Josiah Carberry", "Person"),
+        # A value that is plainly an address beats a generic key.
+        ("name", "192.0.2.1", "IPv4Address"),
+        ("reputation_score", 42, "Phrase"),
+    ],
+)
+def test_infer_output_entity(name: str, sample: Any, expected: str) -> None:
+    assert infer_output_entity(name, sample) == expected
 
 
 def test_parse_curl_command_with_path_and_header() -> None:
@@ -80,15 +127,17 @@ def test_parse_curl_command_with_path_and_header() -> None:
     assert cfg.base_url == "https://api.greynoise.io"
     assert cfg.auth_header_name == "X-API-KEY"
     assert cfg.auth_key_name == "GREYNOISE_API_KEY"
-    assert len(cfg.transforms) == 1
-
-    t = cfg.transforms[0]
+    # The credential travels through the key setting, never as a literal header.
+    assert cfg.headers == {}
+    [t] = cfg.transforms
     assert t.input_entity == "IPv4Address"
-    assert "{target}" in t.endpoint_path
-
-    out_types = t.output_entity_types
-    assert "Phrase" in out_types
-    assert "URL" in out_types
+    assert t.endpoint_path == "/v3/community/{target}"
+    assert t.sample_input == "8.8.8.8"
+    # The looked-up address carries the verdict as properties; the link is a pivot.
+    assert t.mapping.primary is not None
+    assert t.mapping.primary.entity_type == "IPv4Address"
+    assert [p.name for p in t.mapping.properties] == ["noise", "classification"]
+    assert set(t.output_entity_types) == {"IPv4Address", "URL"}
 
 
 def test_parse_curl_command_with_bearer_token_and_query_param() -> None:
@@ -111,6 +160,7 @@ def test_parse_openapi_spec() -> None:
                 "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-Threat-Key"}
             }
         },
+        "security": [{"ApiKeyAuth": []}],
         "paths": {
             "/ip/{ip}": {
                 "get": {
@@ -147,9 +197,12 @@ def test_parse_openapi_spec() -> None:
     assert len(cfg.transforms) == 1
 
     t = cfg.transforms[0]
-    assert t.transform_id == "check_ip"
+    # Prefixed with the service: transform ids are global on the server.
+    assert t.transform_id == "threat_api_check_ip"
     assert t.input_entity == "IPv4Address"
-    assert set(t.output_entity_types) == {"AS", "Country", "Phrase"}
+    assert t.key_required is True
+    assert set(t.output_entity_types) == {"AS", "Country"}
+    assert [p.name for p in t.mapping.properties] == ["score"]
 
 
 def test_generate_service_code() -> None:
@@ -160,37 +213,29 @@ def test_generate_service_code() -> None:
         auth_key_name="TEST_SERVICE_API_KEY",
         transforms=[
             ScaffoldTransformConfig(
-                transform_id="test_lookup",
+                transform_id="test_service_lookup",
                 display_name="Test Service: Lookup",
                 input_entity="IPv4Address",
                 endpoint_path="/lookup/{target}",
-                output_mappings=[
-                    OutputFieldMapping(field_name="asn", entity_type="AS", strip_prefix="AS"),
-                    OutputFieldMapping(
-                        field_name="summary", entity_type="Phrase", label_prefix="Summary: "
-                    ),
-                ],
+                mapping=RecordMapping(
+                    primary=EntityField("AS", ("asn",), "asn", strip_prefix="AS"),
+                    properties=[PropertyField("summary", ("summary",), "Summary")],
+                ),
             )
         ],
     )
 
     files = generate_service_code(cfg)
 
-    assert "api.py" in files
-    assert "lookup.py" in files
-
-    api_code = files["api.py"]
-    assert 'BASE_URL = "https://api.test.com"' in api_code
-    assert 'API_KEY = "TEST_SERVICE_API_KEY"' in api_code
-    assert "def validate_ip" in api_code
-    assert "async def fetch" in api_code
+    assert set(files) == {"__init__.py", "api.py", "lookup.py"}
+    assert 'BASE_URL = "https://api.test.com"' in files["api.py"]
+    assert 'API_KEY = "TEST_SERVICE_API_KEY"' in files["api.py"]
 
     lookup_code = files["lookup.py"]
-    assert "from maltego.entities import AS, IPv4Address, Phrase" in lookup_code
-    assert "TestLookupOutput = AS | Phrase" in lookup_code
-    assert "-> list[TestLookupOutput]:" in lookup_code
+    assert "from maltego.entities import AS, IPv4Address" in lookup_code
+    assert "-> list[TestServiceLookupOutput]:" in lookup_code
     assert "target = validate_ip(input_entity.value)" in lookup_code
-    assert "results.append(AS(" in lookup_code
+    assert 'primary=Entity(AS, ("asn",), "asn", strip="AS")' in lookup_code
 
 
 def test_inject_project_import(tmp_path: Path) -> None:
@@ -218,36 +263,9 @@ if __name__ == "__main__":
     assert inject_project_import(project_py, import_stmt) is False
 
 
-def test_write_scaffold(tmp_path: Path) -> None:
-    project_dir = tmp_path / "server"
-    project_dir.mkdir()
-    project_py = project_dir / "project.py"
-    project_py.write_text("from transforms.examples.ffraud import *  # noqa: F401,F403\n")
-
-    cfg = ScaffoldServiceConfig(
-        service_id="custom_api",
-        display_name="Custom API",
-        base_url="https://api.custom.com",
-        transforms=[
-            ScaffoldTransformConfig(
-                transform_id="custom_lookup",
-                display_name="Custom API: Lookup",
-                input_entity="Domain",
-                endpoint_path="/check",
-                output_mappings=[OutputFieldMapping(field_name="status", entity_type="Phrase")],
-            )
-        ],
-    )
-
-    created = write_scaffold(cfg, project_dir)
-
-    assert len(created) == 3  # __init__.py, api.py, lookup.py
-    assert (project_dir / "transforms" / "custom_api" / "api.py").exists()
-    assert (project_dir / "transforms" / "custom_api" / "lookup.py").exists()
-    assert "from transforms.custom_api.lookup import *" in project_py.read_text()
-
-
-def _service_config(service_id: str = "custom_api") -> ScaffoldServiceConfig:
+def _service_config(
+    service_id: str = "custom_api", sample: str | None = None
+) -> ScaffoldServiceConfig:
     """Return a minimal single-transform service config for write tests."""
     return ScaffoldServiceConfig(
         service_id=service_id,
@@ -255,20 +273,58 @@ def _service_config(service_id: str = "custom_api") -> ScaffoldServiceConfig:
         base_url="https://api.custom.com",
         transforms=[
             ScaffoldTransformConfig(
-                transform_id="custom_lookup",
+                transform_id=f"{service_id}_lookup",
                 display_name="Custom API: Lookup",
                 input_entity="Domain",
                 endpoint_path="/check",
-                output_mappings=[OutputFieldMapping(field_name="status", entity_type="Phrase")],
+                mapping=_entities_mapping("Domain"),
+                sample_input=sample,
             )
         ],
     )
 
 
+def _project(tmp_path: Path) -> Path:
+    project_dir = tmp_path / "server"
+    (project_dir / "transforms").mkdir(parents=True)
+    (project_dir / "project.py").write_text(
+        "from transforms.examples.ffraud import *  # noqa: F401,F403\n"
+    )
+    return project_dir
+
+
+def test_write_scaffold(tmp_path: Path) -> None:
+    project_dir = _project(tmp_path)
+
+    created = write_scaffold(_service_config(sample="example.com"), project_dir)
+
+    svc_dir = project_dir / "transforms" / "custom_api"
+    assert created == [
+        svc_dir / "__init__.py",
+        svc_dir / "api.py",
+        svc_dir / "lookup.py",
+        svc_dir / "samples.json",
+    ]
+    assert json.loads((svc_dir / "samples.json").read_text()) == {
+        "custom_api_lookup": "example.com"
+    }
+    assert "from transforms.custom_api.lookup import *" in (project_dir / "project.py").read_text()
+
+
+def test_planned_paths_match_the_write_and_write_nothing(tmp_path: Path) -> None:
+    """A dry run reports exactly what the real run writes."""
+    project_dir = _project(tmp_path)
+    cfg = _service_config(sample="example.com")
+
+    planned = planned_scaffold_paths(cfg, project_dir)
+
+    assert not (project_dir / "transforms" / "custom_api").exists()
+    assert write_scaffold(cfg, project_dir) == planned
+
+
 def test_write_scaffold_refuses_to_overwrite(tmp_path: Path) -> None:
     """A second scaffold of the same service must not clobber the first."""
-    project_dir = tmp_path / "server"
-    project_dir.mkdir()
+    project_dir = _project(tmp_path)
     cfg = _service_config()
 
     write_scaffold(cfg, project_dir)
@@ -277,14 +333,15 @@ def test_write_scaffold_refuses_to_overwrite(tmp_path: Path) -> None:
 
     with pytest.raises(FileExistsError, match="already exists"):
         write_scaffold(cfg, project_dir)
+    with pytest.raises(FileExistsError, match="already exists"):
+        planned_scaffold_paths(cfg, project_dir)
 
     assert hand_edited.read_text().startswith("# hand-written")
 
 
 def test_write_scaffold_force_overwrites(tmp_path: Path) -> None:
     """`force=True` is the deliberate escape hatch from the overwrite guard."""
-    project_dir = tmp_path / "server"
-    project_dir.mkdir()
+    project_dir = _project(tmp_path)
     cfg = _service_config()
 
     write_scaffold(cfg, project_dir)
@@ -296,73 +353,158 @@ def test_write_scaffold_force_overwrites(tmp_path: Path) -> None:
     assert "IntegrationClient" in api_py.read_text()
 
 
+def test_force_replaces_the_whole_service_and_its_imports(tmp_path: Path) -> None:
+    """A narrower re-scaffold must not leave the old modules or their imports behind.
+
+    Stale modules kept registering their transforms beside the new ones, and the server
+    refused to start on the duplicate names.
+    """
+    project_dir = _project(tmp_path)
+    wide = _service_config()
+    wide.transforms.append(
+        ScaffoldTransformConfig(
+            transform_id="custom_api_other",
+            display_name="Custom API: Other",
+            input_entity="Domain",
+            endpoint_path="/other",
+        )
+    )
+    write_scaffold(wide, project_dir)
+
+    write_scaffold(_service_config(), project_dir, force=True)
+
+    svc_dir = project_dir / "transforms" / "custom_api"
+    assert sorted(p.name for p in svc_dir.iterdir()) == ["__init__.py", "api.py", "lookup.py"]
+    project_text = (project_dir / "project.py").read_text()
+    assert "transforms.custom_api.other" not in project_text
+    assert project_text.count("transforms.custom_api.lookup") == 1
+
+
 def test_write_scaffold_leaves_no_partial_write_on_clash(tmp_path: Path) -> None:
     """A collision on any file aborts before the others are touched."""
-    project_dir = tmp_path / "server"
-    project_dir.mkdir()
-    cfg = _service_config()
+    project_dir = _project(tmp_path)
     svc_dir = project_dir / "transforms" / "custom_api"
-    svc_dir.mkdir(parents=True)
+    svc_dir.mkdir()
     (svc_dir / "lookup.py").write_text("# only this one exists\n")
 
     with pytest.raises(FileExistsError):
-        write_scaffold(cfg, project_dir)
+        write_scaffold(_service_config(), project_dir)
 
     assert not (svc_dir / "api.py").exists()
     assert (svc_dir / "lookup.py").read_text() == "# only this one exists\n"
 
 
-def test_generated_code_has_no_unused_imports() -> None:
-    """Generated modules must not import what they do not use (ruff F401).
-
-    `server/transforms/` is linted, so a scaffold that emits unused imports hands the
-    author a failing gate on untouched, freshly generated code.
-    """
-    # No auth key: neither `os` nor TransformSetting is referenced by the output.
-    cfg = _service_config()
-    cfg.auth_key_name = None
-    api_code = generate_api_module(cfg)
-
-    assert "import os" not in api_code
-    assert "TransformSetting" not in api_code
-    # A Domain validator uses `re`; nothing here uses `ipaddress`.
-    assert "import ipaddress" not in api_code
-
-    # MAX_ITEMS is only imported when a list mapping actually caps a slice.
-    transform_code = generate_transform_module(cfg, cfg.transforms[0])
-    assert "MAX_ITEMS" not in transform_code
-
-
-def test_multiple_validators_are_blank_line_separated() -> None:
-    """Two input types emit two validators, which need two blank lines between them.
-
-    Single-validator services hid this: the separator only had to hold before `fetch`.
-    """
-    cfg = ScaffoldServiceConfig(
-        service_id="multi",
-        display_name="Multi",
-        base_url="https://api.multi.com",
-        auth_key_name="MULTI_API_KEY",
-        transforms=[
-            ScaffoldTransformConfig(
-                transform_id="by_ip",
-                display_name="Multi: By IP",
-                input_entity="IPv4Address",
-                endpoint_path="/ip",
-            ),
-            ScaffoldTransformConfig(
-                transform_id="by_domain",
-                display_name="Multi: By Domain",
-                input_entity="Domain",
-                endpoint_path="/domain",
-            ),
-        ],
+def test_transform_id_defined_by_another_service_is_refused(tmp_path: Path) -> None:
+    """Ids are global on the server: a duplicate anywhere under transforms/ blocks start-up."""
+    project_dir = _project(tmp_path)
+    other = project_dir / "transforms" / "handmade"
+    other.mkdir()
+    (other / "mod.py").write_text(
+        "from maltego.server import register_transform\n\n\n"
+        "@register_transform(display_name='x', transform_set='x', settings=[])\n"
+        "async def custom_api_lookup(input_entity, settings, context):\n"
+        "    return []\n"
     )
 
-    code = generate_api_module(cfg)
+    with pytest.raises(ValueError, match=r"custom_api_lookup .*handmade"):
+        write_scaffold(_service_config(), project_dir)
+    with pytest.raises(ValueError, match="custom_api_lookup"):
+        planned_scaffold_paths(_service_config(), project_dir, force=True)
 
-    assert "\n\n\ndef validate_domain" in code
-    assert "\n\n\nasync def fetch" in code
+    assert not (project_dir / "transforms" / "custom_api").exists()
+
+
+def test_a_second_curl_endpoint_joins_its_service(tmp_path: Path) -> None:
+    """A named endpoint is added beside the first, which keeps working unchanged."""
+    project_dir = _project(tmp_path)
+    first = parse_curl_command("curl https://api.svc.example/ip/8.8.8.8", service_name="svc")
+    second = parse_curl_command(
+        "curl 'https://api.svc.example/domain?name=example.com'",
+        service_name="svc",
+        transform_name="by-domain",
+    )
+    write_scaffold(first, project_dir)
+    api_before = (project_dir / "transforms" / "svc" / "api.py").read_text()
+
+    written = write_scaffold(second, project_dir)
+
+    svc_dir = project_dir / "transforms" / "svc"
+    assert [p.name for p in written] == ["by_domain.py", "samples.json"]
+    assert (svc_dir / "api.py").read_text() == api_before
+    assert json.loads((svc_dir / "samples.json").read_text()) == {
+        "svc_by_domain": "example.com",
+        "svc_lookup": "8.8.8.8",
+    }
+    assert "async def svc_by_domain(" in (svc_dir / "by_domain.py").read_text()
+    project_text = (project_dir / "project.py").read_text()
+    assert "transforms.svc.lookup" in project_text
+    assert "transforms.svc.by_domain" in project_text
+
+
+def test_an_endpoint_needing_a_different_client_is_refused(tmp_path: Path) -> None:
+    """Rewriting api.py for a new endpoint would change how the existing ones call the API."""
+    project_dir = _project(tmp_path)
+    write_scaffold(
+        parse_curl_command("curl https://api.svc.example/ip/8.8.8.8", service_name="svc"),
+        project_dir,
+    )
+    keyed = parse_curl_command(
+        "curl -H 'X-Api-Key: k' 'https://api.svc.example/domain?name=example.com'",
+        service_name="svc",
+        transform_name="by_domain",
+    )
+
+    with pytest.raises(FileExistsError, match=r"different api\.py"):
+        write_scaffold(keyed, project_dir)
+
+    assert not (project_dir / "transforms" / "svc" / "by_domain.py").exists()
+
+
+def test_remove_scaffold_deletes_the_service_and_its_imports(tmp_path: Path) -> None:
+    project_dir = _project(tmp_path)
+    write_scaffold(_service_config(), project_dir)
+    write_scaffold(_service_config("keep_me"), project_dir)
+
+    removed = remove_scaffold("custom_api", project_dir)
+
+    assert removed == [
+        str(project_dir / "transforms" / "custom_api"),
+        "from transforms.custom_api.lookup import *  # noqa: F401,F403",
+    ]
+    assert not (project_dir / "transforms" / "custom_api").exists()
+    project_text = (project_dir / "project.py").read_text()
+    assert "custom_api" not in project_text
+    assert "transforms.keep_me.lookup" in project_text
+    assert "transforms.examples.ffraud" in project_text
+
+
+@pytest.mark.parametrize("service", ["nothing_here", "../escape", "local"])
+def test_remove_scaffold_refuses_what_is_not_a_service(tmp_path: Path, service: str) -> None:
+    project_dir = _project(tmp_path)
+    (project_dir / "transforms" / "local").mkdir()
+
+    with pytest.raises(ValueError, match=service.replace(".", r"\.")):
+        remove_scaffold(service, project_dir)
+
+    assert (project_dir / "transforms" / "local").is_dir()
+
+
+def test_remove_scaffold_refuses_a_hand_written_service(tmp_path: Path) -> None:
+    """`remove-scaffold rdap` deleted a bundled, hand-written service, with no way back."""
+    project_dir = _project(tmp_path)
+    handmade = project_dir / "transforms" / "rdap"
+    handmade.mkdir()
+    (handmade / "api.py").write_text('"""RDAP client, written by hand."""\n')
+    write_scaffold(_service_config(), project_dir)
+
+    with pytest.raises(
+        ValueError, match=r"lacks the line 'Generated by transformatron scaffold\.'"
+    ):
+        remove_scaffold("rdap", project_dir)
+    with pytest.raises(ValueError, match=r"Scaffolded services: custom_api\.$"):
+        remove_scaffold("nothing_here", project_dir)
+
+    assert (handmade / "api.py").exists()
 
 
 def test_openapi_search_param_falls_back_to_real_name() -> None:
@@ -426,11 +568,7 @@ def test_openapi_path_parameter_is_not_turned_into_a_query_param() -> None:
 def test_generated_entity_imports_are_isort_ordered() -> None:
     """Acronym entities sort before CamelCase ones, matching ruff's isort rule."""
     cfg = _service_config()
-    cfg.transforms[0].output_mappings = [
-        OutputFieldMapping(field_name="status", entity_type="Phrase"),
-        OutputFieldMapping(field_name="link", entity_type="URL"),
-        OutputFieldMapping(field_name="ip", entity_type="IPv4Address"),
-    ]
+    cfg.transforms[0].mapping = _entities_mapping("Phrase", "URL", "IPv4Address")
 
     code = generate_transform_module(cfg, cfg.transforms[0])
 
@@ -470,35 +608,63 @@ def test_input_constraint_can_be_suppressed() -> None:
     assert "EntityTypeConstraint" not in code
 
 
-def test_generated_code_passes_the_project_lint_gate(tmp_path: Path) -> None:
-    """Generated modules must survive `ruff check` and `ruff format --check`.
-
-    `server/transforms/` is linted, so a scaffold that emits misordered imports or wrong
-    blank-line spacing hands the author a failing gate on code they have not touched. The
-    import ordering is the live risk: EntityTypeConstraint sits between the entities and
-    server imports, and the entity list itself has to match ruff's case-insensitive sort
-    (Website before WHOISRecord), which is easy to get wrong by hand.
-    """
-    wide = _service_config(service_id="wide")
-    wide.transforms[0].output_mappings = [
-        infer_output_entity(name)
-        for name in ("whois", "website", "certificate", "bitcoin", "mac_address", "name", "link")
-    ]
-
-    for cfg in (_service_config(), _service_config(service_id="authed"), wide):
-        if cfg.service_id == "authed":
-            cfg.auth_key_name = "AUTHED_API_KEY"
-        for name, code in generate_service_code(cfg).items():
-            (tmp_path / f"{cfg.service_id}_{name}").write_text(code)
-
+def _ruff_gate(directory: Path) -> None:
     for args in (["check"], ["format", "--check"]):
         result = subprocess.run(
-            ["uv", "run", "ruff", *args, str(tmp_path)],
+            ["uv", "run", "ruff", *args, str(directory)],
             capture_output=True,
             text=True,
             cwd=Path(__file__).parent.parent,
         )
         assert result.returncode == 0, f"ruff {args[0]} failed:\n{result.stdout}\n{result.stderr}"
+
+
+def _write_all(directory: Path, configs: list[ScaffoldServiceConfig]) -> None:
+    for index, cfg in enumerate(configs):
+        for name, code in generate_service_code(cfg).items():
+            compile(code, name, "exec")
+            (directory / f"c{index}_{cfg.service_id}_{name}").write_text(code)
+
+
+def test_generated_code_passes_the_project_lint_gate(tmp_path: Path) -> None:
+    """Generated modules must survive `ruff check` and `ruff format --check`.
+
+    `server/transforms/` is linted, so a scaffold that emits misordered imports, unused
+    imports or wrong blank-line spacing hands the author a failing gate on code they have
+    not touched. Covered: keyless, keyed and query-keyed clients, extra headers, an
+    optional key, a placeholder mapping, and mappings with nested records and many types.
+    """
+    wide = _service_config(service_id="wide")
+    wide.transforms[0].mapping = RecordMapping(
+        path=("data",),
+        primary=EntityField("WHOISRecord", ("whois",), "whois"),
+        entities=[
+            EntityField(t, (f"f{i}", "deeper"), f"f{i}")
+            for i, t in enumerate(["Website", "X509Certificate", "BTCAddress", "MacAddress"])
+        ],
+        nested=[
+            RecordMapping(
+                path=("containers", "cna", "references"),
+                primary=EntityField("URL", ("url",), "references.url"),
+                properties=[PropertyField("tags", ("tags",), "Tags")],
+            )
+        ],
+        enrich_input=True,
+    )
+    authed = _service_config(service_id="authed")
+    authed.auth_key_name = "AUTHED_API_KEY"
+    authed.auth_type = "header"
+    authed.headers = {"Accept": "application/json", "User-Agent": "research"}
+    optional = _service_config(service_id="optional")
+    optional.auth_key_name = "OPTIONAL_API_KEY"
+    optional.auth_type = "query"
+    optional.auth_query_param = "key"
+    optional.transforms[0].key_required = False
+    placeholder = _service_config(service_id="placeholder")
+    placeholder.transforms[0].mapping = ScaffoldTransformConfig("x", "x", "Domain", "/").mapping
+
+    _write_all(tmp_path, [_service_config(), authed, optional, placeholder, wide])
+    _ruff_gate(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -526,7 +692,7 @@ def test_qualified_entity_type_rejects_unknown_names() -> None:
 @pytest.mark.parametrize(
     ("field_name", "entity_type"),
     [
-        ("name", "Person"),
+        ("full_name", "Person"),
         ("company", "Company"),
         ("phone", "PhoneNumber"),
         ("username", "Alias"),
@@ -547,12 +713,30 @@ def test_widened_output_entities(field_name: str, entity_type: str) -> None:
     A Phrase renders as text an investigator cannot pivot from, so every field left
     unmapped is a dead end in the graph.
     """
-    assert infer_output_entity(field_name).entity_type == entity_type
+    assert infer_output_entity(field_name) == entity_type
 
 
 def test_org_still_maps_to_isp() -> None:
     """`org` stays with ISP: on IP-lookup APIs it is the network operator, not a company."""
-    assert infer_output_entity("org").entity_type == "ISP"
+    assert infer_output_entity("org") == "ISP"
+
+
+_TYPE_POOL = [
+    "URL",
+    "Alias",
+    "BTCAddress",
+    "City",
+    "Company",
+    "CryptocurrencyAddress",
+    "Image",
+    "MacAddress",
+    "Malware",
+    "Person",
+    "PhoneNumber",
+    "Port",
+    "WHOISRecord",
+    "X509Certificate",
+]
 
 
 def test_many_output_entities_stay_within_the_line_limit() -> None:
@@ -562,31 +746,14 @@ def test_many_output_entities_stay_within_the_line_limit() -> None:
     either one crossing 100 characters fails E501 on freshly generated code.
     """
     cfg = _service_config()
-    cfg.transforms[0].output_mappings = [
-        infer_output_entity(name)
-        for name in (
-            "name",
-            "company",
-            "phone",
-            "username",
-            "avatar",
-            "mac_address",
-            "port",
-            "bitcoin",
-            "wallet",
-            "website",
-            "malware",
-            "certificate",
-            "whois",
-        )
-    ]
+    cfg.transforms[0].mapping = _entities_mapping(*_TYPE_POOL)
 
     code = generate_transform_module(cfg, cfg.transforms[0])
 
     assert all(len(line) <= 100 for line in code.splitlines())
-    # The union is named once rather than inlined at both use sites.
-    assert "CustomLookupOutput = (" in code
-    assert "-> list[CustomLookupOutput]:" in code
+    # The union is named once rather than inlined in the signature.
+    assert "CustomApiLookupOutput = (" in code
+    assert "-> list[CustomApiLookupOutput]:" in code
 
 
 @pytest.mark.parametrize("count", range(1, 15))
@@ -597,26 +764,8 @@ def test_output_alias_matches_ruff_at_every_width(count: int, tmp_path: Path) ->
     and `ruff format --check` then fails on code the author has not touched. The boundary
     between the three layouts is the part worth pinning.
     """
-    pool = [
-        "URL",
-        "Alias",
-        "BTCAddress",
-        "City",
-        "Company",
-        "CryptocurrencyAddress",
-        "Image",
-        "MacAddress",
-        "Malware",
-        "Person",
-        "PhoneNumber",
-        "Port",
-        "WHOISRecord",
-        "X509Certificate",
-    ]
     cfg = _service_config(service_id=f"w{count}")
-    cfg.transforms[0].output_mappings = [
-        OutputFieldMapping(field_name=f"f{i}", entity_type=t) for i, t in enumerate(pool[:count])
-    ]
+    cfg.transforms[0].mapping = _entities_mapping(*_TYPE_POOL[:count])
 
     for name, code in generate_service_code(cfg).items():
         (tmp_path / name).write_text(code)
@@ -658,6 +807,7 @@ def _query_auth_spec() -> dict[str, object]:
         "components": {
             "securitySchemes": {"apiKey": {"type": "apiKey", "in": "query", "name": "apikey"}}
         },
+        "security": [{"apiKey": []}],
         "paths": {
             "/lookup": {
                 "get": {
@@ -677,28 +827,15 @@ def test_query_auth_scheme_is_recorded_by_the_parser() -> None:
 
     assert cfg.auth_type == "query"
     assert cfg.auth_query_param == "apikey"
-
-
-def test_query_auth_key_is_actually_sent() -> None:
-    """A query-auth client sends the key.
-
-    The generated fetch() refused to run without a key and then never attached it, so
-    every request went out unauthenticated and failed only against the live API.
-    """
-    cfg = parse_openapi_spec(_query_auth_spec(), service_name="qa")
-    code = generate_api_module(cfg)
-
-    assert 'params["apikey"] = api_key' in code
-    # params may arrive as None from a templated path, so it is copied before mutation.
-    assert "params = dict(params or {})" in code
+    assert cfg.transforms[0].key_required is True
 
 
 def test_colliding_transform_ids_are_all_generated() -> None:
-    """Operations that slugify to the same id each get a module.
+    """Operations that slugify to the same id each get a module, under the id reported.
 
     "do scan" and "do-scan" both slugify to do_scan. Keying the output dict on that
-    dropped every colliding transform but the last, and the duplicate function name
-    would have shadowed the survivor inside the module anyway.
+    dropped every colliding transform but the last; numbering them only in the generator
+    registered ids other than the ones the scaffold printed.
     """
     spec = {
         "openapi": "3.0.0",
@@ -725,33 +862,69 @@ def test_colliding_transform_ids_are_all_generated() -> None:
     cfg = parse_openapi_spec(spec, service_name="dup")
     files = generate_service_code(cfg)
 
+    assert [t.transform_id for t in cfg.transforms] == ["dup_do_scan_a", "dup_do_scan_b"]
     module_files = sorted(n for n in files if n not in ("__init__.py", "api.py"))
-    assert module_files == ["do_scan.py", "do_scan_2.py"]
-    assert "async def do_scan(" in files["do_scan.py"]
-    assert "async def do_scan_2(" in files["do_scan_2.py"]
+    assert module_files == ["do_scan_a.py", "do_scan_b.py"]
+    assert "async def dup_do_scan_a(" in files["do_scan_a.py"]
+    assert "async def dup_do_scan_b(" in files["do_scan_b.py"]
 
 
 _QUERY_Q = {"name": "q", "in": "query", "required": True}
 
 
-def test_generate_service_code_does_not_mutate_config() -> None:
-    """Deduplicating filenames must not rewrite the caller's transform ids."""
-    cfg = parse_openapi_spec(
-        {
-            "openapi": "3.0.0",
-            "info": {"title": "Dup2", "version": "1.0.0"},
-            "servers": [{"url": "https://dup2.example"}],
-            "paths": {
-                "/a": {"get": {"operationId": "x y", "parameters": [_QUERY_Q], "responses": {}}},
-                "/b": {"get": {"operationId": "x-y", "parameters": [_QUERY_Q], "responses": {}}},
+def test_shared_operation_ids_get_distinct_ids_and_names() -> None:
+    """CIRCL reuses `get_last` for four paths; each becomes its own, recognisable transform.
+
+    They were scaffolded as identical modules with one display name, and the ids printed
+    differed from those the server registered.
+    """
+    ok = {"200": {"description": "ok"}}
+    by_number = {"name": "number", "in": "path", "required": True}
+    by_source = {"name": "source", "in": "path", "required": True}
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Vulns"},
+        "servers": [{"url": "https://vulns.example/api"}],
+        "paths": {
+            "/vulnerability/last/{number}": {
+                "get": {"operationId": "get_last", "summary": "Latest", "parameters": [by_number]}
+                | {"responses": ok}
             },
+            "/vulnerability/last/{source}": {
+                "get": {"operationId": "get_last", "summary": "Latest", "parameters": [by_source]}
+                | {"responses": ok}
+            },
+            "/kev": {"get": {"operationId": "get_kev", "parameters": [_QUERY_Q], "responses": ok}},
+            "/kev/": {"get": {"operationId": "get_kev", "parameters": [_QUERY_Q], "responses": ok}},
         },
-        service_name="dup2",
-    )
+    }
 
-    generate_service_code(cfg)
+    cfg = parse_openapi_spec(spec, operations=["get_last"])
+    infos = {info.transform_id: info for info in list_openapi_operations(spec)}
 
-    assert [t.transform_id for t in cfg.transforms] == ["x_y", "x_y"]
+    ids = [t.transform_id for t in cfg.transforms]
+    assert ids == ["vulns_get_last_by_number", "vulns_get_last_by_source"]
+    assert [t.display_name for t in cfg.transforms] == [
+        "Vulns: Latest (by number)",
+        "Vulns: Latest (by source)",
+    ]
+    assert sorted(infos) == sorted([*ids, "vulns_get_kev", "vulns_get_kev_2"])
+    assert all(info.duplicate for info in infos.values())
+    # The generated functions are registered under exactly the ids reported.
+    files = generate_service_code(cfg)
+    assert "async def vulns_get_last_by_number(" in files["get_last_by_number.py"]
+    # One of them alone, by the id --list-operations shows.
+    [one] = parse_openapi_spec(spec, operations=["vulns_get_last_by_source"]).transforms
+    assert one.endpoint_path == "/vulnerability/last/{target}"
+
+
+def test_a_config_with_duplicate_transform_ids_is_refused() -> None:
+    """Renaming one quietly would register an id other than the one the author was shown."""
+    cfg = _service_config()
+    cfg.transforms.append(cfg.transforms[0])
+
+    with pytest.raises(ValueError, match="share the id 'custom_api_lookup'"):
+        generate_service_code(cfg)
 
 
 def test_scaffold_reports_existing_service_instead_of_overwriting(tmp_path: Path) -> None:
@@ -770,7 +943,7 @@ def test_scaffold_reports_existing_service_instead_of_overwriting(tmp_path: Path
 
 
 def test_scaffold_reports_malformed_openapi_spec(tmp_path: Path) -> None:
-    """A spec that is not JSON is a caller error, reported rather than raised."""
+    """A spec that is neither JSON nor YAML is a caller error, reported rather than raised."""
     config = TransformatronConfig(project_dir=tmp_path / "server", state_dir=tmp_path / "state")
     config.project_dir.mkdir(parents=True)
 
@@ -799,6 +972,13 @@ def test_service_names_that_cannot_be_packages_are_rejected(name: str) -> None:
     """The service id becomes a directory and a dotted import; a bad one breaks startup."""
     with pytest.raises(ValueError, match=r"not usable|Could not derive"):
         parse_curl_command("curl https://api.x.example/ip/8.8.8.8", service_name=name)
+
+
+@pytest.mark.parametrize("name", ["api", "samples", "1st", "class"])
+def test_endpoint_names_that_cannot_be_modules_are_rejected(name: str) -> None:
+    """`api` would replace the shared client; the rest would not import."""
+    with pytest.raises(ValueError, match="not usable as a module name"):
+        parse_curl_command("curl https://api.x.example/ip/8.8.8.8", transform_name=name)
 
 
 def test_hyphenated_service_name_becomes_a_package_name() -> None:
@@ -832,9 +1012,77 @@ def test_resource_names_in_the_path_are_not_taken_for_domains() -> None:
     assert cfg.transforms[0].input_entity == "IPv4Address"
 
 
-def test_sample_response_that_is_not_json_is_reported() -> None:
-    with pytest.raises(ValueError, match="not valid JSON"):
-        parse_curl_command("curl https://api.x.example/ip/8.8.8.8", sample_response="<html>")
+def test_path_segment_that_looks_like_a_value_is_the_input() -> None:
+    """ORCID's `/v3.0/<id>/person` must template the id, not the resource word."""
+    cfg = parse_curl_command("curl https://pub.orcid.org/v3.0/0000-0002-1825-0097/person")
+    [transform] = cfg.transforms
+
+    assert transform.endpoint_path == "/v3.0/{target}/person"
+    assert transform.sample_input == "0000-0002-1825-0097"
+
+
+def test_sample_response_that_is_not_json_is_reported_as_unsupported() -> None:
+    """HackerTarget answers CSV; the error says that is unsupported and what to do instead."""
+    with pytest.raises(ValueError, match="not valid JSON") as raised:
+        parse_curl_command(
+            "curl 'https://api.hackertarget.example/hostsearch/?q=python.org'",
+            sample_response="www.python.org,151.101.0.223\nmail.python.org,188.166.95.178\n",
+        )
+
+    message = str(raised.value)
+    assert "CSV and plain-text responses are not supported" in message
+    assert "replace RECORDS and map_records()" in message
+
+
+def test_curl_keeps_request_details_and_notes_what_it_drops() -> None:
+    """Headers, the user agent, the referer and cookies are part of the request.
+
+    ORCID answers XML without `Accept: application/json`, and SEC EDGAR refuses a request
+    with no User-Agent, so dropping them zeroed both live.
+    """
+    cfg = parse_curl_command(
+        "curl -sS --compressed -A 'research bot ops@example.org' -e https://ref.example "
+        "-b 'session=abc' -H 'Accept: application/json' -H 'Accept-Encoding: br' "
+        "-H 'X-Api-Key: secret' -x http://proxy:8080 "
+        "'https://api.x.example/v1/issuances?domain=example.com&expand=a&expand=b'"
+    )
+
+    assert cfg.headers == {
+        "User-Agent": "research bot ops@example.org",
+        "Referer": "https://ref.example",
+        "Accept": "application/json",
+        "Cookie": "session=abc",
+    }
+    assert cfg.auth_header_name == "X-Api-Key"
+    assert cfg.transforms[0].query_params == {"domain": "example.com", "expand": ["a", "b"]}
+    notes = " ".join(cfg.notes)
+    assert "proxy" in notes
+    assert "Accept-Encoding" in notes
+    assert "Cookie" in notes
+
+
+def test_curl_without_a_sample_notes_the_placeholder_output() -> None:
+    cfg = parse_curl_command("curl https://api.x.example/ip/8.8.8.8")
+
+    assert any("placeholder" in note for note in cfg.notes)
+
+
+def test_notes_point_at_dry_run_only_in_a_trailing_sentence() -> None:
+    """A dry run cuts each note at "Preview with --dry-run", so it never tells the author to
+    do what they are doing; any other mention would survive the cut."""
+    spec = _two_operation_spec()
+    spec["paths"]["/things/{id}"]["get"]["responses"] = {"200": {"description": "ok"}}
+    notes = [
+        *parse_curl_command("curl https://api.x.example/ip/8.8.8.8").notes,
+        *parse_openapi_spec(spec).notes,
+        *parse_curl_command("curl https://api.x.example/ip/8.8.8.8", {"a": [{"b": 1}]}).notes,
+    ]
+
+    pointing = [note for note in notes if "--dry-run" in note]
+    assert pointing, "the placeholder notes point at a preview"
+    for note in pointing:
+        kept, _, cut = note.partition(" Preview with --dry-run")
+        assert cut and "--dry-run" not in kept, note
 
 
 def _two_operation_spec() -> dict[str, Any]:
@@ -880,7 +1128,7 @@ def test_post_operations_are_skipped_unless_named() -> None:
     """A POST may create or change data upstream, so scaffolding one is a deliberate choice."""
     cfg = parse_openapi_spec(_two_operation_spec())
 
-    assert [t.transform_id for t in cfg.transforms] == ["get_thing"]
+    assert [t.transform_id for t in cfg.transforms] == ["two_get_thing"]
     assert any("createThing" in note for note in cfg.notes)
 
 
@@ -896,8 +1144,8 @@ def test_named_post_operation_is_scaffolded_with_its_body() -> None:
     assert transform.request_body["owner"] == "me"
 
 
-def test_unknown_operation_name_is_an_error() -> None:
-    with pytest.raises(ValueError, match="deleteEverything"):
+def test_unknown_operation_name_is_an_error_listing_the_real_ones() -> None:
+    with pytest.raises(ValueError, match=r"deleteEverything.*getThing, createThing"):
         parse_openapi_spec(_two_operation_spec(), operations=["deleteEverything"])
 
 
@@ -915,7 +1163,7 @@ def test_operation_whose_path_cannot_be_filled_is_skipped_with_a_reason() -> Non
 
     cfg = parse_openapi_spec(spec)
 
-    assert "list_hosts" not in [t.transform_id for t in cfg.transforms]
+    assert "two_list_hosts" not in [t.transform_id for t in cfg.transforms]
     assert any("listHosts" in note and "{zone}" in note for note in cfg.notes)
 
 
@@ -927,6 +1175,354 @@ def test_unsupported_auth_is_reported_instead_of_guessed() -> None:
 
     assert cfg.auth_key_name is None
     assert any("oauth2" in note for note in cfg.notes)
+
+
+def test_paging_parameters_are_never_the_input() -> None:
+    """An operation whose only parameters page the result is skipped, not keyed on `page`."""
+    spec = _two_operation_spec()
+    spec["paths"]["/users"] = {
+        "get": {
+            "operationId": "listUsers",
+            "parameters": [
+                {"name": "page", "in": "query"},
+                {"name": "per_page", "in": "query"},
+            ],
+        }
+    }
+    spec["paths"]["/search"] = {
+        "get": {
+            "operationId": "search",
+            "parameters": [
+                {"name": "page", "in": "query"},
+                {"name": "q", "in": "query", "required": True},
+            ],
+        }
+    }
+
+    cfg = parse_openapi_spec(spec)
+    by_id = {t.transform_id: t for t in cfg.transforms}
+
+    assert "two_list_users" not in by_id
+    assert any("listUsers" in note and "page" in note for note in cfg.notes)
+    assert by_id["two_search"].input_param_name == "q"
+    assert "page" not in by_id["two_search"].query_params
+
+
+def test_state_changing_get_operations_are_skipped_unless_named() -> None:
+    """`GET /session/create/{name}` creates state upstream; it is no lookup."""
+    spec = _two_operation_spec()
+    spec["paths"]["/session/create/{name}"] = {
+        "get": {
+            "operationId": "createSession",
+            "parameters": [{"name": "name", "in": "path", "required": True}],
+        }
+    }
+
+    default = parse_openapi_spec(spec)
+    named = parse_openapi_spec(spec, operations=["createSession"])
+
+    assert "two_create_session" not in [t.transform_id for t in default.transforms]
+    assert any("createSession" in note and "state" in note for note in default.notes)
+    assert [t.transform_id for t in named.transforms] == ["two_create_session"]
+
+
+@pytest.mark.parametrize(
+    ("path", "operation_id", "writes"),
+    [
+        ("/session/get/{name}", "get_session_matches", False),
+        ("/sessions/{id}", "getSession", False),
+        ("/vulnerability/last-update/{id}", "getLastUpdate", False),
+        ("/session/create/{name}", "get_session_create", True),
+        ("/users/{id}/reset-password", "getUser", True),
+        ("/things/{id}", "deleteThing", True),
+    ],
+)
+def test_only_a_verb_marks_a_get_operation_as_changing_state(
+    path: str, operation_id: str, writes: bool
+) -> None:
+    """CIRCL's `GET /session/get/{name}` reads a session; only `/session/create` makes one."""
+    spec = _two_operation_spec()
+    spec["paths"][path] = {
+        "get": {
+            "operationId": operation_id,
+            "parameters": [{"name": path.rsplit("{")[-1].strip("}"), "in": "path"}],
+        }
+    }
+
+    [info] = [i for i in list_openapi_operations(spec) if i.operation_id == operation_id]
+
+    assert ("changes state" in (info.skipped_reason or "")) is writes
+
+
+@pytest.mark.parametrize(
+    ("document", "spec_url", "base_url"),
+    [
+        # CIRCL vulnerability-lookup: Swagger 2, basePath, no host.
+        (
+            {"swagger": "2.0", "basePath": "/api"},
+            "https://vulnerability.circl.lu/api/swagger.json",
+            "https://vulnerability.circl.lu/api",
+        ),
+        (
+            {"swagger": "2.0", "host": "api.x.example", "basePath": "/v1"},
+            "http://docs.x.example/swagger.json",
+            "http://api.x.example/v1",
+        ),
+        (
+            {"swagger": "2.0", "host": "api.x.example", "schemes": ["https"], "basePath": "/"},
+            None,
+            "https://api.x.example",
+        ),
+        # Petstore: an OpenAPI 3 server relative to the spec's URL.
+        (
+            {"openapi": "3.0.0", "servers": [{"url": "/api/v3"}]},
+            "https://petstore3.swagger.io/api/v3/openapi.json",
+            "https://petstore3.swagger.io/api/v3",
+        ),
+    ],
+)
+def test_base_url_keeps_the_spec_base_path(
+    document: dict[str, Any], spec_url: str | None, base_url: str
+) -> None:
+    """Dropping `/api` sent every request to the wrong path, reported as "no record"."""
+    spec = {
+        **document,
+        "info": {"title": "Base"},
+        "paths": {"/vulnerability/{id}": {"get": {"parameters": [{"name": "id", "in": "path"}]}}},
+    }
+
+    assert parse_openapi_spec(spec, spec_url=spec_url).base_url == base_url
+
+
+def _hash_spec(sha1_param: dict[str, Any]) -> dict[str, Any]:
+    """CIRCL hashlookup's sha1 lookup: Swagger 2, no example for the hash."""
+    return {
+        "swagger": "2.0",
+        "host": "hashlookup.example",
+        "info": {"title": "hashlookup"},
+        "paths": {
+            "/lookup/sha1/{sha1}": {
+                "get": {
+                    "operationId": "get_lookup_sha1",
+                    "parameters": [{"name": "sha1", "in": "path", "required": True, **sha1_param}],
+                }
+            }
+        },
+    }
+
+
+_SHA1 = "732458574c63c3790cad093a36eadfb990d11ee6"
+_HASH_RESPONSE = {
+    "MD5": "E7793F15C2FF7E747B4BC7079F5CD4E7",
+    "SHA-1": _SHA1.upper(),
+    "FileName": "./bin/ls",
+}
+
+
+def test_openapi_sample_input_is_recorded_and_recognised_as_the_input(tmp_path: Path) -> None:
+    """Without it no samples.json was written, the smoke test sent an MD5 to the sha1 lookup,
+    and the MD5 became the record's entity instead of enriching the input SHA-1."""
+    cfg = parse_openapi_spec(
+        _hash_spec({}), sample_response=_HASH_RESPONSE, sample_input=f" {_SHA1} "
+    )
+    [transform] = cfg.transforms
+
+    assert transform.sample_input == _SHA1
+    assert transform.mapping.primary is not None
+    assert transform.mapping.primary.path == ("SHA-1",)
+    assert transform.mapping.enrich_input is True
+    project_dir = _project(tmp_path)
+    write_scaffold(cfg, project_dir)
+    samples = json.loads((project_dir / "transforms" / "hashlookup" / "samples.json").read_text())
+    assert samples == {"hashlookup_get_lookup_sha1": _SHA1}
+
+
+@pytest.mark.parametrize("example_key", ["example", "x-example"])
+def test_openapi_parameter_example_is_the_sample_input(example_key: str) -> None:
+    cfg = parse_openapi_spec(_hash_spec({example_key: _SHA1}))
+
+    assert cfg.transforms[0].sample_input == _SHA1
+    assert not any("No sample input" in note for note in cfg.notes)
+
+
+def test_openapi_without_a_sample_input_says_how_to_give_one() -> None:
+    cfg = parse_openapi_spec(_hash_spec({}))
+
+    assert cfg.transforms[0].sample_input is None
+    assert any("No sample input" in note and "--sample-input" in note for note in cfg.notes)
+
+
+def test_sample_input_for_several_operations_is_refused() -> None:
+    spec = _two_operation_spec()
+    spec["paths"]["/other/{id}"] = {
+        "get": {"operationId": "other", "parameters": [{"name": "id", "in": "path"}]}
+    }
+
+    with pytest.raises(ValueError, match="--sample-input"):
+        parse_openapi_spec(spec, sample_input="x")
+
+
+@pytest.mark.parametrize(
+    ("title", "label"),
+    [("Vulnerability-Lookup API", "Vulnerability-Lookup API Key"), ("Crtsh", "Crtsh API Key")],
+)
+def test_key_messages_name_the_api_once(title: str, label: str) -> None:
+    """A spec titled "... API" read "No Vulnerability-Lookup API API key configured"."""
+    cfg = _service_config()
+    cfg.display_name, cfg.auth_key_name = title, "SVC_API_KEY"
+
+    api = generate_api_module(cfg)
+
+    assert f'API_KEY_LABEL = "{label}"' in api
+    assert "display_name=API_KEY_LABEL" in api
+    assert 'f"No {API_KEY_LABEL} configured.' in api
+    assert "API API" not in api
+
+
+def test_a_long_summary_is_cut_at_a_word_without_three_dots(tmp_path: Path) -> None:
+    """A literal '...' ended Maltego menu names; the ellipsis character reads as one."""
+    spec = _two_operation_spec()
+    spec["paths"]["/things/{id}"]["get"]["summary"] = (
+        "Retrieve the latest vulnerabilities, with optional filters for the source and the "
+        "number of results"
+    )
+
+    cfg = parse_openapi_spec(spec, operations=["getThing"])
+    [transform] = cfg.transforms
+
+    assert "..." not in transform.display_name
+    assert transform.display_name.endswith("\u2026")
+    assert len(transform.display_name) <= 80
+    assert transform.display_name.startswith("Two: Retrieve the latest vulnerabilities")
+    _write_all(tmp_path, [cfg])
+    _ruff_gate(tmp_path)
+
+
+def test_optional_security_makes_the_key_optional() -> None:
+    """`{}` among the requirements, or `security: []`, means the API answers without a key."""
+    spec = _two_operation_spec()
+    spec["components"] = {
+        "securitySchemes": {"key": {"type": "apiKey", "in": "header", "name": "X-Key"}}
+    }
+    spec["security"] = [{"key": []}]
+    spec["paths"]["/things/{id}"]["get"]["security"] = []
+    spec["paths"]["/open/{ip}"] = {
+        "get": {
+            "operationId": "open",
+            "security": [{}, {"key": []}],
+            "parameters": [{"name": "ip", "in": "path", "required": True}],
+        }
+    }
+    spec["paths"]["/closed/{ip}"] = {
+        "get": {
+            "operationId": "closed",
+            "parameters": [{"name": "ip", "in": "path", "required": True}],
+        }
+    }
+
+    by_id = {t.transform_id: t for t in parse_openapi_spec(spec).transforms}
+
+    assert by_id["two_get_thing"].key_required is False
+    assert by_id["two_open"].key_required is False
+    assert by_id["two_closed"].key_required is True
+
+
+def test_yaml_spec_is_parsed_like_json() -> None:
+    yaml_text = """
+openapi: 3.0.0
+info: {title: Yammy}
+servers: [{url: "https://yam.example"}]
+paths:
+  /ip/{ip}:
+    get:
+      operationId: getIp
+      parameters: [{name: ip, in: path, required: true, example: 192.0.2.7}]
+      responses:
+        200:
+          content:
+            application/json:
+              example: {ip: 192.0.2.7, hostname: host.example}
+"""
+    cfg = parse_openapi_spec(yaml_text)
+    [transform] = cfg.transforms
+
+    assert transform.transform_id == "yammy_get_ip"
+    assert transform.sample_input == "192.0.2.7"
+    assert set(transform.output_entity_types) == {"IPv4Address", "Domain"}
+
+
+@pytest.mark.parametrize("text", ["", "{not json at all", "just a sentence", "- a\n- list\n"])
+def test_load_spec_rejects_what_is_not_a_spec(text: str) -> None:
+    with pytest.raises(ValueError, match="OpenAPI spec"):
+        load_spec(text)
+
+
+def test_list_operations_shows_every_operation_and_why_it_would_be_skipped() -> None:
+    spec = _two_operation_spec()
+    spec["paths"]["/users"] = {
+        "get": {"operationId": "listUsers", "parameters": [{"name": "page", "in": "query"}]}
+    }
+
+    infos = {info.operation_id: info for info in list_openapi_operations(spec)}
+
+    assert set(infos) == {"getThing", "createThing", "listUsers"}
+    thing = infos["getThing"]
+    assert (thing.transform_id, thing.method, thing.path) == (
+        "two_get_thing",
+        "GET",
+        "/things/{id}",
+    )
+    assert thing.input == "Phrase (path {id})"
+    assert thing.has_response_schema is True
+    assert thing.skipped_reason is None
+    assert "POST" in (infos["createThing"].skipped_reason or "")
+    assert infos["listUsers"].input == "-"
+    assert "paging" in (infos["listUsers"].skipped_reason or "")
+
+
+def test_openapi_sample_response_is_used_for_a_single_operation() -> None:
+    """A real response beats a schema-less spec's placeholder output."""
+    cfg = parse_openapi_spec(
+        _two_operation_spec(),
+        operations=["getThing"],
+        sample_response={"domain": "a.example", "risk": "high"},
+    )
+    [transform] = cfg.transforms
+
+    assert transform.output_entity_types == ["Domain"]
+    assert [p.name for p in transform.mapping.properties] == ["risk"]
+
+
+def test_openapi_sample_response_for_several_operations_is_refused() -> None:
+    spec = _two_operation_spec()
+    spec["paths"]["/other/{id}"] = {
+        "get": {"operationId": "other", "parameters": [{"name": "id", "in": "path"}]}
+    }
+
+    with pytest.raises(ValueError, match="--operation"):
+        parse_openapi_spec(spec, sample_response={"a": 1})
+
+
+def test_operation_without_a_response_schema_notes_its_placeholder() -> None:
+    spec = _two_operation_spec()
+    spec["paths"]["/things/{id}"]["get"]["responses"] = {"200": {"description": "ok"}}
+
+    cfg = parse_openapi_spec(spec)
+
+    assert any("two_get_thing" in note and "placeholder" in note for note in cfg.notes)
+
+
+def test_many_operations_without_a_choice_are_flagged() -> None:
+    spec = _two_operation_spec()
+    for index in range(25):
+        spec["paths"][f"/r{index}/{{id}}"] = {
+            "get": {"operationId": f"r{index}", "parameters": [{"name": "id", "in": "path"}]}
+        }
+
+    cfg = parse_openapi_spec(spec)
+
+    assert len(cfg.transforms) == 26
+    assert any("--operation" in note and "26 operations" in note for note in cfg.notes)
 
 
 def test_generated_code_from_hostile_spec_text_passes_the_lint_gate(tmp_path: Path) -> None:
@@ -960,44 +1556,42 @@ def test_generated_code_from_hostile_spec_text_passes_the_lint_gate(tmp_path: Pa
         },
     }
     cfg = parse_openapi_spec(spec, service_name="evil")
-    for name, code in generate_service_code(cfg).items():
-        compile(code, name, "exec")
-        (tmp_path / name).write_text(code)
-
-    for args in (["check"], ["format", "--check"]):
-        result = subprocess.run(
-            ["uv", "run", "ruff", *args, str(tmp_path)],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent,
-        )
-        assert result.returncode == 0, f"ruff {args[0]} failed:\n{result.stdout}\n{result.stderr}"
-
-
-def _ruff_gate(directory: Path) -> None:
-    for args in (["check"], ["format", "--check"]):
-        result = subprocess.run(
-            ["uv", "run", "ruff", *args, str(directory)],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent,
-        )
-        assert result.returncode == 0, f"ruff {args[0]} failed:\n{result.stdout}\n{result.stderr}"
+    _write_all(tmp_path, [cfg])
+    _ruff_gate(tmp_path)
 
 
 def test_generated_code_passes_the_lint_gate_at_the_edges(tmp_path: Path) -> None:
-    """Long names, long keys, non-finite numbers and typographic text all stay lint-clean.
+    """Long names, long keys, deep paths, non-finite numbers and typographic text all stay
+    lint-clean.
 
     Each of these once produced a module that failed `ruff check` or `ruff format --check`,
     and the non-finite float one a module that could not even be imported.
     """
     long_key = "an_unusually_long_response_field_name_that_real_apis_do_sometimes_return"
+    deep = {
+        "containers": {
+            "cna": {
+                "references": [{"url": "https://a.example", long_key: "x", "tags": ["a"]}],
+                "affected": [{"vendor": "Acme Corp", "product": "Widget"}],
+                "title": "A rather long title",
+            }
+        },
+        "cveMetadata": {"cveId": "CVE-2021-44228", "assignerOrgIdentifierLongName": "x"},
+    }
     configs = [
         # A long service id overflows the `from transforms.<svc>.api import ...` line.
         parse_curl_command(
-            "curl -H 'X-Api-Key: abc' 'https://api.x.example/v2/lookup/8.8.8.8'",
+            "curl -H 'X-Api-Key: abc' -A 'agent' 'https://api.x.example/v2/lookup/8.8.8.8'",
             {"ip": "8.8.8.8", "tags": ["a"], long_key: "x", "nested": {long_key: "y"}},
             service_name="a_rather_long_service_identifier",
+        ),
+        parse_curl_command("curl https://cveawg.example/api/cve/CVE-2021-44228", deep),
+        parse_curl_command(
+            "curl https://cveawg.example/api/cve/CVE-2021-44228",
+            deep,
+            service_name="cve_refs",
+            records="containers.cna.references",
+            mappings=[f"{long_key}=Phrase"],
         ),
         # NaN and Infinity are accepted by json.loads and must not become bare names.
         parse_curl_command(
@@ -1021,11 +1615,7 @@ def test_generated_code_passes_the_lint_gate_at_the_edges(tmp_path: Path) -> Non
             }
         ),
     ]
-    for index, cfg in enumerate(configs):
-        for name, code in generate_service_code(cfg).items():
-            compile(code, name, "exec")
-            (tmp_path / f"c{index}_{name}").write_text(code)
-
+    _write_all(tmp_path, configs)
     _ruff_gate(tmp_path)
 
 
@@ -1083,9 +1673,10 @@ def test_key_declared_as_a_query_parameter_is_treated_as_auth() -> None:
 
     assert (cfg.auth_type, cfg.auth_query_param) == ("query", "key")
     assert cfg.auth_key_name == "SHODANISH_API_KEY"
-    assert "key" not in by_id["host_information"].query_params
-    assert by_id["search_host"].input_param_name == "query"
-    assert "key" not in by_id["search_host"].query_params
+    assert "key" not in by_id["shodanish_host_information"].query_params
+    assert by_id["shodanish_host_information"].key_required is True
+    assert by_id["shodanish_search_host"].input_param_name == "query"
+    assert "key" not in by_id["shodanish_search_host"].query_params
 
 
 def test_key_like_parameter_on_only_some_operations_stays_data() -> None:
@@ -1102,14 +1693,12 @@ def test_key_like_parameter_on_only_some_operations_stays_data() -> None:
 
 def test_operation_named_api_does_not_replace_the_shared_client() -> None:
     spec = _two_operation_spec()
-    spec["paths"]["/other"] = {
-        "get": {"operationId": "API", "parameters": [{"name": "q", "in": "query"}]}
-    }
+    spec["paths"]["/other"] = {"get": {"operationId": "API", "parameters": [_QUERY_Q]}}
 
-    files = generate_service_code(parse_openapi_spec(spec))
+    files = generate_service_code(parse_openapi_spec(spec, operations=["API", "getThing"]))
 
     assert "async def fetch(" in files["api.py"]
-    assert "async def api_2(" in files["api_2.py"]
+    assert "async def two_api(" in files["api_2.py"]
 
 
 def test_search_term_beats_the_resource_path_segment() -> None:
@@ -1169,7 +1758,7 @@ def test_swagger2_body_and_form_parameters_carry_the_input() -> None:
         for t in parse_openapi_spec(spec, operations=["scan", "lookup"]).transforms
     }
 
-    scan, lookup = by_id["scan"], by_id["lookup"]
+    scan, lookup = by_id["old_scan"], by_id["old_lookup"]
     assert (scan.input_location, scan.input_param_name, scan.body_encoding) == (
         "body",
         "ip",

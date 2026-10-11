@@ -10,6 +10,7 @@ import pytest
 from transformatron.client import (
     RunResult,
     TransformClient,
+    TransformNotFoundError,
     TransformServerError,
     build_run_request,
     collect_events,
@@ -45,12 +46,19 @@ def delete_event(input_type: str, item_id: str) -> dict[str, Any]:
     return {"data": {"inputType": input_type, "eventType": "DELETE", key: {"id": item_id}}}
 
 
-def status_event(text: str) -> dict[str, Any]:
+def status_event(text: str, level: str | None = None) -> dict[str, Any]:
+    """A status message as ``TransformMessageEvent.to_v3_event`` sends it.
+
+    ``level`` is the StatusMessage ``type``; None leaves it out, as the protocol allows.
+    """
+    status: dict[str, Any] = {"text": text}
+    if level is not None:
+        status["type"] = level
     return {
         "data": {
             "inputType": "STATUS_MESSAGE",
             "eventType": "ADD",
-            "statusMessage": {"text": text},
+            "statusMessage": status,
         }
     }
 
@@ -147,6 +155,30 @@ def test_collect_events_sorts_by_type() -> None:
     assert [e["value"] for e in result.entities] == ["keep"]
     assert len(result.links) == 1
     assert result.messages == ["working"]
+
+
+def test_each_message_keeps_its_severity() -> None:
+    """An upstream 403 logged with log.fatal must be told apart from an informational note.
+
+    Both runs end COMPLETED, so the severity is the only signal; a message without a type
+    is INFO, the protocol's default.
+    """
+    result = RunResult(run_id="r", state="RUNNING")
+    collect_events(
+        [
+            status_event("API access forbidden (403)", "ERROR"),
+            status_event("Only partial results", "WARNING"),
+            status_event("No record for this input"),
+        ],
+        result,
+    )
+
+    assert result.messages == [
+        "API access forbidden (403)",
+        "Only partial results",
+        "No record for this input",
+    ]
+    assert result.message_levels == ["ERROR", "WARNING", "INFO"]
 
 
 def test_an_event_without_an_event_type_is_an_add() -> None:
@@ -250,6 +282,29 @@ async def test_failed_run_surfaces_its_status_message(
     assert "Invalid input: boom" in result.messages
 
 
+async def test_a_message_pushed_just_after_failure_is_still_collected(
+    config: TransformatronConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SDK sets FAILED before it pushes the message explaining the crash.
+
+    A poll landing between the two saw FAILED with no message, so the run reported a
+    failure with no reason at all.
+    """
+    crash = status_event("Unexpected exception while executing transform Demo", "ERROR")
+    fake = FakeServer(
+        [
+            {"result": {"state": "FAILED", "events": []}},
+            {"result": {"state": "FAILED", "events": [crash]}},
+        ]
+    )
+    patch_transport(monkeypatch, fake)
+
+    result = await TransformClient(config).run_transform("t", "maltego.Phrase", "x", timeout=5)
+
+    assert result.messages == ["Unexpected exception while executing transform Demo"]
+    assert result.message_levels == ["ERROR"]
+
+
 async def test_events_are_not_double_counted_across_polls(
     config: TransformatronConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -328,6 +383,7 @@ async def test_timeout_cancels_the_run_server_side(
     assert result.state == "TIMED_OUT"
     assert not result.succeeded
     assert fake.cancelled, "a run abandoned by the client must be cancelled server-side"
+    assert result.message_levels == ["ERROR"], "the client's own timeout note is an error"
 
 
 async def test_missing_run_id_is_an_error(
@@ -364,6 +420,26 @@ async def test_http_error_status_is_reported(
 
     with pytest.raises(TransformServerError, match="404"):
         await TransformClient(config).get_transform("missing")
+
+
+@pytest.mark.parametrize("lost", ["transform", "run"])
+async def test_an_unknown_transform_id_is_told_apart_from_an_unknown_run(
+    config: TransformatronConfig, monkeypatch: pytest.MonkeyPatch, lost: str
+) -> None:
+    """Only an unknown transform id may earn a 'check the id' hint; a lost run must not."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if lost == "run" and request.url.path.endswith("/run"):
+            return httpx.Response(201, json={"result": {"runId": "r1"}})
+        detail = "Transform with id t not found" if lost == "transform" else "Run not found"
+        return httpx.Response(404, json={"detail": detail})
+
+    patch_handler(monkeypatch, handler)
+
+    with pytest.raises(TransformServerError) as raised:
+        await TransformClient(config).run_transform("t", "maltego.Phrase", "x")
+    assert isinstance(raised.value, TransformNotFoundError) is (lost == "transform")
+    assert raised.value.status_code == 404
 
 
 async def test_a_non_json_response_is_a_server_error(
