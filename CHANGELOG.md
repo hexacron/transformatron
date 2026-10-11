@@ -124,7 +124,7 @@ All notable changes to this project are recorded here. The format follows
 
 ## [0.1.0] - 2026-09-28
 
-Everything on `main` up to `06abe61`. Not tagged.
+Everything on `main` up to `06abe61`, tagged `v0.1.0`.
 
 ### Added
 
