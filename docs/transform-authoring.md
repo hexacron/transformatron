@@ -208,7 +208,8 @@ one that returns a list is called twice per run (`__add_sync_results`,
 8. **Smoke test** before calling it done.
 
 `--force` replaces the whole service directory and its `project.py` imports — hand edits and any
-other endpoint added to it with `--name` included. Once you have edited a module, edit rather than
+other endpoint added to it with `--name` included — and refuses a service the scaffolder did not
+write. Once you have edited a module, edit rather than
 re-scaffold. To undo a scaffold, use `remove-scaffold <service>` (`remove_scaffold` over MCP);
 never delete the directory by hand — its imports stay in `project.py` and the server no longer
 starts. `remove-scaffold` refuses a service whose `api.py` lacks the line

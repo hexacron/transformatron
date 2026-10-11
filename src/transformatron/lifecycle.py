@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -470,9 +470,14 @@ def stop(config: TransformatronConfig) -> str:
     server has to be killed, the message names the cause found in the log lines written
     since SIGTERM; earlier lines belong to previous runs and would mislead.
     """
+    return _stop(config)[0]
+
+
+def _stop(config: TransformatronConfig) -> tuple[str, bool]:
+    """Stop the server and return the message and whether it had to be killed."""
     pid = read_pid(config)
     if pid is None:
-        return "Server is not running."
+        return "Server is not running.", False
 
     https = read_scheme(config) == "https"
     log_offset = _log_size(config)
@@ -482,18 +487,21 @@ def stop(config: TransformatronConfig) -> str:
         cause = _shutdown_stall_cause(_read_log_from(config, log_offset), https)
         # The SDK's shutdown only stops runner threads and closes its auth client, and
         # middleware.py has no flush hooks, so a kill skips nothing worth keeping.
-        return (
+        message = (
             f"Server did not exit within {SHUTDOWN_TIMEOUT:g}s and was killed (pid {pid}). "
             f"{cause} Nothing was lost: the server keeps no state that a clean shutdown "
             "would have saved."
         )
-    return f"Server stopped (pid {pid})."
+        return message, True
+    return f"Server stopped (pid {pid}).", False
 
 
 def restart(config: TransformatronConfig, ssl: bool | None = None) -> ServerStatus:
     """Stop the server if running, then start it again.
 
-    This is the reload path after adding or editing a transform module.
+    This is the reload path after adding or editing a transform module, so a stop that
+    had to kill the server is reported with its cause ahead of the start: otherwise a
+    transform blocking its runner thread shows up only as an unexplained 10s pause.
 
     Args:
         ssl: Serve over HTTPS. When ``None`` the scheme the server is currently
@@ -506,5 +514,8 @@ def restart(config: TransformatronConfig, ssl: bool | None = None) -> ServerStat
     """
     if ssl is None:
         ssl = read_scheme(config) == "https"
-    stop(config)
-    return start(config, ssl=ssl)
+    stopped, killed = _stop(config)
+    status = start(config, ssl=ssl)
+    if killed:
+        return replace(status, detail=f"{stopped}\n{status.detail}")
+    return status

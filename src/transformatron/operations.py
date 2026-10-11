@@ -674,7 +674,9 @@ def _format_inventory(inventory: list[FieldReport]) -> list[str]:
     return lines
 
 
-def list_operations(config: TransformatronConfig, openapi: str, service: str | None = None) -> str:
+def list_operations(
+    config: TransformatronConfig, openapi: str | dict[str, Any], service: str | None = None
+) -> str:
     """List the operations of an OpenAPI spec and what scaffolding each would produce.
 
     ``service`` is the name a scaffold would be given, so the transform ids shown are the

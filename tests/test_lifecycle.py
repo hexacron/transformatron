@@ -322,6 +322,23 @@ def test_killed_stop_ignores_log_lines_from_earlier_runs(
     assert "runner thread" not in message
 
 
+def test_restart_reports_why_the_old_server_had_to_be_killed(
+    config: TransformatronConfig,
+    stalling_server: Callable[[list[str]], subprocess.Popen],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restart is the reload path agents use most; a kill there must not pass unexplained."""
+    process = stalling_server(["Shutting down", "Waiting for application shutdown."])
+    config.scheme_file.write_text("http")
+    _record_restart_scheme(config, monkeypatch)
+
+    status = lifecycle.restart(config)
+
+    assert process.poll() is not None
+    assert "blocking the runner thread" in status.detail
+    assert status.detail.endswith("started")
+
+
 def test_build_server_env_pins_host_port_and_scheme(config: TransformatronConfig) -> None:
     env = lifecycle.build_server_env(config)
 

@@ -145,3 +145,27 @@ async def test_a_numeric_sample_input_reaches_the_scaffold_as_text(tmp_path: Pat
     assert not result.is_error, _text(result)
     assert "sample input: 1" in _text(result)
     assert "run acme.new_maltego_integration.pets_get_pet_by_id " in _text(result)
+
+
+async def test_list_operations_accepts_a_spec_passed_as_an_object() -> None:
+    """scaffold_transform takes an object spec; the tool the docs say to call first must too."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Pets", "version": "1.0.0"},
+        "servers": [{"url": "https://pets.example"}],
+        "paths": {
+            "/pet/{petId}": {
+                "get": {
+                    "operationId": "getPetById",
+                    "parameters": [{"name": "petId", "in": "path", "required": True}],
+                    "responses": {"200": {"description": "ok"}},
+                }
+            }
+        },
+    }
+
+    async with Client(mcp_front_end.server) as client:
+        result = await client.call_tool("list_operations", {"openapi": spec})
+
+    assert not result.is_error, _text(result)
+    assert "getPetById" in _text(result)

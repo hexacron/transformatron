@@ -82,7 +82,8 @@ All notable changes to this project are recorded here. The format follows
   `purge`, `flush`, `revoke`, `subscribe`, `unsubscribe`, `start`, `stop`), and operations whose
   only input is a paging or optional parameter, are skipped unless named. Where the spec allows
   anonymous access the key is sent when set and not required.
-- `scaffold --force` replaces the whole service directory and its `project.py` imports. A
+- `scaffold --force` replaces the whole service directory and its `project.py` imports, and
+  refuses a service the scaffolder did not write. A
   transform id already defined anywhere under `transforms/` is refused before anything is written,
   and the service name `local` is reserved.
 - Key-name heuristics match on camel, kebab and snake words, and the value can veto a name match

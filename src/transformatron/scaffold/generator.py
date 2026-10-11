@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import json
+import keyword
 import math
 import re
 import shutil
@@ -132,6 +133,35 @@ def _lit(text: str) -> str:
         body = body.replace('\\"', '"').replace("'", "\\'")
         return f"'{body}'"
     return f'"{body}"'
+
+
+def _const(name: str, text: str) -> str:
+    """Return ``NAME = "text"`` laid out the way ``ruff format`` would keep it.
+
+    Flat when it fits; otherwise parenthesised onto its own line; and when even that is too
+    long, split at spaces into implicitly concatenated parts, one per line. Ruff leaves a
+    too-long single string flat, which fails E501, so a long spec title would otherwise fail
+    the project's lint gate on freshly generated code.
+    """
+    literal = _lit(text)
+    flat = f"{name} = {literal}"
+    if len(flat) <= _LINE_LIMIT:
+        return flat
+    if len(f"    {literal}") <= _LINE_LIMIT:
+        return f"{name} = (\n    {literal}\n)"
+    parts: list[str] = []
+    for word in text.split(" "):
+        candidate = f"{parts[-1]} {word}" if parts else word
+        if parts and len(f"    {_lit(candidate + ' ')}") <= _LINE_LIMIT:
+            parts[-1] = candidate
+        elif parts:
+            parts.append(word)
+        else:
+            parts = [word]
+    # Each part but the last keeps its trailing space, so the joined text is unchanged.
+    lines = [_lit(part + " ") for part in parts[:-1]] + [_lit(parts[-1])]
+    body = "".join(f"    {line}\n" for line in lines)
+    return f"{name} = (\n{body})"
 
 
 def _braces(text: str) -> str:
@@ -376,12 +406,17 @@ class _Emitted:
     """An entity returned by map_records(), with every value each property was given."""
 
     entity: MaltegoEntity
-    values: dict[str, list[Any]] = field(default_factory=dict)
+    # Each property's distinct values in first-seen order; a dict is an ordered set.
+    values: dict[str, dict[Any, None]] = field(default_factory=dict)
 
     def add(self, prop: Prop, values: list[Any]) -> None:
-        held = self.values.setdefault(prop.name, [])
-        held.extend(value for value in values if value not in held)
-        value = held[0] if len(held) == 1 else ", ".join(str(v) for v in held)
+        held = self.values.setdefault(prop.name, {})
+        for value in values:
+            if len(held) >= MAX_ITEMS:
+                break
+            held.setdefault(value, None)
+        kept = list(held)
+        value = kept[0] if len(kept) == 1 else ", ".join(str(v) for v in kept)
         try:
             self.entity.set_property(prop.name, value, display_name=prop.label)
         except (TypeError, ValueError):
@@ -450,7 +485,8 @@ def _add(
 
 def _scalars(record: Any, prop: Prop) -> list[Any]:
     """Return the plain values of a property field; an object there is not a property."""
-    return [value for value in pluck(record, prop.path) if not isinstance(value, dict | list)]
+    values = [value for value in pluck(record, prop.path) if not isinstance(value, dict | list)]
+    return values[:MAX_ITEMS]
 '''
 
 
@@ -497,8 +533,8 @@ def generate_api_module(config: ScaffoldServiceConfig) -> str:
         # Named once, so the setting and the message agree, and named the way the service
         # is: a spec title already ending in "API" gets no second one.
         key_label = f"{_api_name(config.display_name)} Key"
-        setting_code = f"""API_KEY = {_lit(config.auth_key_name or "")}
-API_KEY_LABEL = {_lit(key_label)}
+        setting_code = f"""{_const("API_KEY", config.auth_key_name or "")}
+{_const("API_KEY_LABEL", key_label)}
 
 
 def api_key_setting() -> TransformSetting:
@@ -566,8 +602,8 @@ from maltego.model.entity import MaltegoEntity
 from maltego.model.exception import MaltegoException, MaltegoHTTPDataProviderNotFound
 {setting_import}from maltego.util import IntegrationClient
 
-BASE_URL = {_lit(config.base_url.rstrip("/"))}
-SERVICE_NAME = {_lit(config.display_name)}
+{_const("BASE_URL", config.base_url.rstrip("/"))}
+{_const("SERVICE_NAME", config.display_name)}
 TRANSFORM_SET = SERVICE_NAME
 # Records read from each list in a response, and values from each field: a cap on what
 # one run returns.
@@ -860,7 +896,9 @@ def _module_plan(config: ScaffoldServiceConfig) -> list[tuple[str, ScaffoldTrans
             )
         used_ids.add(transform.transform_id)
         base = transform.transform_id.removeprefix(f"{config.service_id}_")
-        if not base.isidentifier():
+        # A keyword passes isidentifier() but makes the project.py import a SyntaxError,
+        # which stops the server starting.
+        if not base.isidentifier() or keyword.iskeyword(base):
             base = transform.transform_id
         module, n = base, 1
         while module in used_modules:
@@ -992,10 +1030,28 @@ def _plan(config: ScaffoldServiceConfig, project_dir: Path, force: bool) -> _Pla
     modules = _module_plan(config)
     existing = svc_dir.exists()
 
+    if force and existing and not _is_generated(svc_dir):
+        # --force replaces the whole directory, so the same rule as remove-scaffold holds:
+        # a service the scaffolder did not write may hold work that exists nowhere else.
+        raise ValueError(
+            f"{config.service_id} was not written by the scaffolder: {svc_dir / 'api.py'} "
+            f"lacks the line '{GENERATED_MARKER}', so --force will not replace it. Scaffold "
+            "under another service name (--service), or move the existing service aside "
+            "by hand first."
+        )
     plan = _Plan(svc_dir, replace_existing=force and existing)
     plan.imports = [_import_line(config.service_id, module) for module, _ in modules]
     samples = {t.transform_id: t.sample_input for _, t in modules if t.sample_input}
 
+    if existing and not force and not _is_generated(svc_dir):
+        # Writing a marked api.py into a hand-written directory that has none would make
+        # the whole directory look scaffolded, and remove-scaffold or --force would then
+        # delete the hand-written modules beside it.
+        raise FileExistsError(
+            f"{config.service_id} already exists at {svc_dir} and was not written by the "
+            "scaffolder, so nothing is added to it. Scaffold under another service name "
+            "(--service)."
+        )
     if existing and not force:
         # Scaffolding a service that already exists is nearly always a mistake —
         # hand-written modules accumulate behaviour a generator cannot recover (upstream
@@ -1008,9 +1064,7 @@ def _plan(config: ScaffoldServiceConfig, project_dir: Path, force: bool) -> _Pla
             raise FileExistsError(
                 f"{config.service_id} already exists at {svc_dir} and already has "
                 f"{', '.join(clashing)}; scaffolding would overwrite it. To add another "
-                "endpoint to this service, give it a new name (--name). To replace the whole "
-                "service, scaffold again with force (--force on the CLI), or remove it first "
-                "(remove-scaffold)."
+                "endpoint to this service, give it a new name (--name)." + _REPLACE_HINT
             )
         api_path = svc_dir / "api.py"
         if api_path.exists() and api_path.read_text() != files["api.py"]:
@@ -1018,8 +1072,8 @@ def _plan(config: ScaffoldServiceConfig, project_dir: Path, force: bool) -> _Pla
                 f"{config.service_id} already exists at {svc_dir} with a different api.py: "
                 "its base URL, authentication or headers differ from this scaffold, or it "
                 "was edited by hand. Adding this endpoint would change how the existing "
-                "transforms call the API. Scaffold it as its own service (--service), or "
-                "replace the whole service with force (--force on the CLI)."
+                "transforms call the API. Scaffold it as its own service (--service)."
+                + _REPLACE_HINT
             )
         for name, code in files.items():
             if name in ("__init__.py", "api.py") and (svc_dir / name).exists():
@@ -1113,6 +1167,14 @@ def write_scaffold(
     return plan.paths
 
 
+# Offered only once a service is known to be scaffolded: a hand-written one is refused
+# before any hint is given.
+_REPLACE_HINT = (
+    " To replace the whole service, scaffold again with force (--force on the CLI), "
+    "or remove it first (remove-scaffold)."
+)
+
+
 def _is_generated(svc_dir: Path) -> bool:
     """Return whether a service directory was written by the scaffolder.
 
@@ -1166,6 +1228,12 @@ def remove_scaffold(service_id: str, project_dir: Path) -> list[str]:
         raise ValueError(
             f"No service named {service_id!r} under {transforms_dir}. Scaffolded services: "
             f"{', '.join(services) or 'none'}."
+        )
+    # On a case-insensitive filesystem `Demo` reaches `demo/`, while the project.py imports
+    # are matched case-sensitively: the directory would go and its imports would stay.
+    if svc_dir.is_dir() and service_id not in {p.name for p in transforms_dir.iterdir()}:
+        raise ValueError(
+            f"No service named exactly {service_id!r}; service names are case-sensitive."
         )
     if svc_dir.is_dir() and not _is_generated(svc_dir):
         raise ValueError(

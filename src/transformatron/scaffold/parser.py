@@ -581,13 +581,72 @@ _EXAMPLE_BY_FORMAT = {
     "hostname": "example.com",
 }
 _EXAMPLE_DEPTH_LIMIT = 8
+# Nodes a spec may expand to once YAML aliases are followed. Aliases share structure, so a
+# small file can expand into billions of nodes ("billion laughs"), and everything after
+# loading walks the expanded tree.
+_SPEC_NODE_LIMIT = 2_000_000
+
+
+class _SpecLoader(yaml.SafeLoader):
+    """SafeLoader that leaves yes/no/on/off as strings.
+
+    YAML 1.1 reads those as booleans, which turns a property called `on` or `no` into a
+    bool key. OpenAPI documents are written to YAML 1.2, where only true/false are.
+    """
+
+
+_SpecLoader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_SpecLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+)
+
+
+def _string_keys(node: Any, memo: dict[int, Any]) -> Any:
+    """Return ``node`` with every mapping key a string, sharing what aliases shared.
+
+    Keys such as `2021` or `null` load as other types and break code that treats a field
+    name as text. ``memo`` keeps an aliased subtree converted once, not once per use.
+    """
+    if isinstance(node, dict | list) and id(node) in memo:
+        return memo[id(node)]
+    if isinstance(node, dict):
+        converted: dict[str, Any] = {}
+        memo[id(node)] = converted
+        for key, value in node.items():
+            converted[str(key).lower() if isinstance(key, bool) else str(key)] = _string_keys(
+                value, memo
+            )
+        return converted
+    if isinstance(node, list):
+        items: list[Any] = []
+        memo[id(node)] = items
+        items.extend(_string_keys(value, memo) for value in node)
+        return items
+    return node
+
+
+def _expanded_size(node: Any, memo: dict[int, int]) -> int:
+    """Return how many nodes ``node`` has once shared (aliased) subtrees are expanded."""
+    if not isinstance(node, dict | list):
+        return 1
+    if id(node) in memo:
+        return memo[id(node)]
+    memo[id(node)] = 1  # a self-referencing alias counts once rather than looping
+    children = node.values() if isinstance(node, dict) else node
+    size = 1 + sum(_expanded_size(child, memo) for child in children)
+    memo[id(node)] = size
+    return size
 
 
 def load_spec(text: str) -> dict[str, Any]:
     """Parse an OpenAPI document written as JSON or YAML.
 
     Raises:
-        ValueError: If the text is neither, or is not a mapping.
+        ValueError: If the text is neither, is not a mapping, or expands to more than
+            ``_SPEC_NODE_LIMIT`` nodes.
     """
     stripped = text.strip()
     if not stripped:
@@ -596,7 +655,8 @@ def load_spec(text: str) -> dict[str, Any]:
         document = json.loads(stripped)
     except json.JSONDecodeError as json_error:
         try:
-            document = yaml.safe_load(stripped)
+            # _SpecLoader is a SafeLoader: no YAML tag can construct Python objects.
+            document = yaml.load(stripped, Loader=_SpecLoader)
         except yaml.YAMLError as yaml_error:
             raise ValueError(
                 f"The OpenAPI spec is neither JSON ({json_error}) nor YAML "
@@ -607,7 +667,12 @@ def load_spec(text: str) -> dict[str, Any]:
             "The OpenAPI spec is not a JSON or YAML object. Pass the document, a path to "
             "it, or its URL."
         )
-    return document
+    if _expanded_size(document, {}) > _SPEC_NODE_LIMIT:
+        raise ValueError(
+            f"The OpenAPI spec expands to more than {_SPEC_NODE_LIMIT:,} nodes once its YAML "
+            "aliases are followed; it is too large to scaffold from."
+        )
+    return _string_keys(document, {})
 
 
 class _Spec:
@@ -635,13 +700,26 @@ class _Spec:
             node = target if target is not None else {}
         return node
 
-    def example(self, schema: Any, depth: int = 0, response: bool = False) -> Any:
+    def example(
+        self,
+        schema: Any,
+        depth: int = 0,
+        response: bool = False,
+        expanding: frozenset[str] = frozenset(),
+    ) -> Any:
         """Build a representative value for a schema, preferring the spec's own examples.
 
         For a response, a string with no example or format is None rather than the word
         ``"string"``: the mapping judges fields by their values too, and a made-up value
-        would only mislead it.
+        would only mislead it. ``expanding`` holds the refs already open on this branch;
+        schemas that refer back to each other through their properties would otherwise
+        expand exponentially before the depth limit stops them.
         """
+        ref = schema.get("$ref") if isinstance(schema, dict) else None
+        if isinstance(ref, str):
+            if ref in expanding:
+                return None
+            expanding = expanding | {ref}
         schema = self.resolve(schema)
         if not isinstance(schema, dict) or depth > _EXAMPLE_DEPTH_LIMIT:
             return None
@@ -650,26 +728,27 @@ class _Spec:
         if "allOf" in schema:
             merged: dict[str, Any] = {}
             for part in schema["allOf"]:
-                value = self.example(part, depth + 1, response)
+                value = self.example(part, depth + 1, response, expanding)
                 if isinstance(value, dict):
                     merged.update(value)
             return merged
         for combinator in ("oneOf", "anyOf"):
             if schema.get(combinator):
-                return self.example(schema[combinator][0], depth + 1, response)
+                return self.example(schema[combinator][0], depth + 1, response, expanding)
 
         schema_type = schema.get("type")
         if isinstance(schema_type, list):
             schema_type = next((t for t in schema_type if t != "null"), None)
         if schema_type == "array" or "items" in schema:
-            item = self.example(schema.get("items", {}), depth + 1, response)
+            item = self.example(schema.get("items", {}), depth + 1, response, expanding)
             # A response list of plain strings keeps its one unknown element, so the field
             # is still mapped by its name.
             return [item] if item is not None or response else []
         if schema_type == "object" or "properties" in schema:
             properties = schema.get("properties", {}) or {}
             return {
-                name: self.example(prop, depth + 1, response) for name, prop in properties.items()
+                name: self.example(prop, depth + 1, response, expanding)
+                for name, prop in properties.items()
             }
         if schema.get("enum"):
             return schema["enum"][0]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import keyword
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -345,12 +346,12 @@ def test_write_scaffold_force_overwrites(tmp_path: Path) -> None:
     cfg = _service_config()
 
     write_scaffold(cfg, project_dir)
-    api_py = project_dir / "transforms" / "custom_api" / "api.py"
-    api_py.write_text("# stale\n")
+    lookup_py = project_dir / "transforms" / "custom_api" / "lookup.py"
+    lookup_py.write_text("# stale\n")
 
     write_scaffold(cfg, project_dir, force=True)
 
-    assert "IntegrationClient" in api_py.read_text()
+    assert "register_transform" in lookup_py.read_text()
 
 
 def test_force_replaces_the_whole_service_and_its_imports(tmp_path: Path) -> None:
@@ -505,6 +506,27 @@ def test_remove_scaffold_refuses_a_hand_written_service(tmp_path: Path) -> None:
         remove_scaffold("nothing_here", project_dir)
 
     assert (handmade / "api.py").exists()
+
+
+def test_force_refuses_to_replace_a_hand_written_service(tmp_path: Path) -> None:
+    """--force deletes the whole directory, so it must spare work the scaffolder never wrote.
+
+    The refusal for an existing service used to point at --force even for hand-written
+    ones, and following it deleted their modules and imports.
+    """
+    project_dir = _project(tmp_path)
+    handmade = project_dir / "transforms" / "custom_api"
+    handmade.mkdir()
+    (handmade / "api.py").write_text('"""Client, written by hand."""\n')
+    (handmade / "lookup.py").write_text("# hand-written transform\n")
+
+    with pytest.raises(FileExistsError) as refused:
+        write_scaffold(_service_config(), project_dir)
+    assert "--force" not in str(refused.value)
+    with pytest.raises(ValueError, match=r"so --force will not replace it"):
+        write_scaffold(_service_config(), project_dir, force=True)
+
+    assert (handmade / "lookup.py").read_text() == "# hand-written transform\n"
 
 
 def test_openapi_search_param_falls_back_to_real_name() -> None:
@@ -1457,6 +1479,121 @@ def test_load_spec_rejects_what_is_not_a_spec(text: str) -> None:
         load_spec(text)
 
 
+def test_yaml_keys_that_yaml_1_1_would_type_stay_field_names() -> None:
+    """`on`, `no` and `2021` load as a bool and an int, which broke the mapping with a TypeError."""
+    yaml_text = """
+openapi: 3.0.0
+info: {title: Yammy}
+servers: [{url: "https://yammy.example"}]
+paths:
+  /item/{ip}:
+    get:
+      operationId: getItem
+      parameters: [{name: ip, in: path, required: true}]
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {on: "a.example", no: 1, 2021: "b.example"}
+"""
+    spec = load_spec(yaml_text)
+    [transform] = parse_openapi_spec(spec).transforms
+
+    paths = {report.path for report in transform.inventory}
+    assert {"on", "no", "2021"} <= paths
+
+
+def test_a_spec_that_expands_into_a_billion_nodes_is_refused() -> None:
+    """Aliases make a tiny file expand exponentially, and mapping walks the expanded tree."""
+    levels = ["a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+    levels += [f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * 10)}]" for i in range(1, 8)]
+
+    with pytest.raises(ValueError, match="too large to scaffold"):
+        load_spec("\n".join(levels))
+
+
+def test_schemas_that_refer_to_each_other_do_not_expand_exponentially() -> None:
+    """Five schemas each referring to all five took 20s to scaffold before refs were tracked."""
+    names = [f"S{i}" for i in range(5)]
+    schemas = {
+        name: {
+            "type": "object",
+            "properties": {
+                other.lower(): {"$ref": f"#/components/schemas/{other}"} for other in names
+            },
+        }
+        for name in names
+    }
+    ok = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/S0"}}}}
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Loops"},
+        "servers": [{"url": "https://loops.example"}],
+        "components": {"schemas": schemas},
+        "paths": {
+            "/thing/{ip}": {
+                "get": {
+                    "operationId": "getThing",
+                    "parameters": [{"name": "ip", "in": "path", "required": True}],
+                    "responses": {"200": ok},
+                }
+            }
+        },
+    }
+
+    [transform] = parse_openapi_spec(spec).transforms
+
+    assert transform.transform_id == "loops_get_thing"
+
+
+def test_an_operation_named_like_a_keyword_gets_an_importable_module(tmp_path: Path) -> None:
+    """`files_global` under service `files` became `global.py`, a SyntaxError in project.py."""
+    project_dir = _project(tmp_path)
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Files"},
+        "servers": [{"url": "https://files.example"}],
+        "paths": {
+            "/global/{ip}": {
+                "get": {
+                    "operationId": "files_global",
+                    "parameters": [{"name": "ip", "in": "path", "required": True}],
+                }
+            }
+        },
+    }
+
+    written = write_scaffold(parse_openapi_spec(spec), project_dir)
+
+    assert all(not keyword.iskeyword(path.stem) for path in written)
+    compile((project_dir / "project.py").read_text(), "project.py", "exec")
+
+
+def test_a_hand_written_service_without_api_py_is_not_added_to(tmp_path: Path) -> None:
+    """A marked api.py written beside hand-written modules made remove-scaffold delete them."""
+    project_dir = _project(tmp_path)
+    handmade = project_dir / "transforms" / "custom_api"
+    handmade.mkdir()
+    (handmade / "ffraud.py").write_text("# hand-written transform\n")
+
+    with pytest.raises(FileExistsError, match="not written by the scaffolder"):
+        write_scaffold(_service_config(), project_dir)
+
+    assert sorted(p.name for p in handmade.iterdir()) == ["ffraud.py"]
+
+
+def test_remove_scaffold_needs_the_service_name_exactly(tmp_path: Path) -> None:
+    """On a case-insensitive filesystem `Demo` deleted `demo/` and left its imports behind."""
+    project_dir = _project(tmp_path)
+    write_scaffold(_service_config("demo"), project_dir)
+
+    with pytest.raises(ValueError, match="'Demo'"):
+        remove_scaffold("Demo", project_dir)
+
+    assert (project_dir / "transforms" / "demo").is_dir()
+    assert "transforms.demo." in (project_dir / "project.py").read_text()
+
+
 def test_list_operations_shows_every_operation_and_why_it_would_be_skipped() -> None:
     spec = _two_operation_spec()
     spec["paths"]["/users"] = {
@@ -1613,6 +1750,30 @@ def test_generated_code_passes_the_lint_gate_at_the_edges(tmp_path: Path) -> Non
                     }
                 },
             }
+        ),
+        # A long keyed title pushes API_KEY_LABEL and SERVICE_NAME past the line limit.
+        parse_openapi_spec(
+            {
+                "openapi": "3.0.0",
+                "info": {
+                    "title": "Cybersecurity and Infrastructure Security Agency Known Exploited "
+                    "Vulnerabilities Catalogue"
+                },
+                "servers": [{"url": "https://kev.example"}],
+                "components": {
+                    "securitySchemes": {"k": {"type": "apiKey", "in": "header", "name": "X-Key"}}
+                },
+                "security": [{"k": []}],
+                "paths": {
+                    "/cve/{cve}": {
+                        "get": {
+                            "operationId": "getKev",
+                            "parameters": [{"name": "cve", "in": "path", "required": True}],
+                        }
+                    }
+                },
+            },
+            service_name="kev",
         ),
     ]
     _write_all(tmp_path, configs)

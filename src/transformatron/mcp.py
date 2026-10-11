@@ -309,7 +309,7 @@ async def scaffold_transform(
 
 
 @server.tool()
-async def list_operations(openapi: str, service: str | None = None) -> str:
+async def list_operations(openapi: str | dict[str, Any], service: str | None = None) -> str:
     """List the operations in an OpenAPI spec and what scaffolding each would produce.
 
     One row per operation: HTTP method, path, operation id (pass it to
@@ -319,7 +319,7 @@ async def list_operations(openapi: str, service: str | None = None) -> str:
 
     Args:
         openapi: An OpenAPI/Swagger spec in JSON or YAML: a URL, a file path, or the
-            document itself.
+            document itself (as text or as an object).
         service: The service name you will scaffold under, so the transform ids shown
             match the ones scaffold_transform generates.
     """

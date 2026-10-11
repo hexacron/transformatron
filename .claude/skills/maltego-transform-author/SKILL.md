@@ -74,7 +74,8 @@ uv run python scripts/transformatron_cli.py run <namespace>.<id> <type> <sample 
 sample input; the input is also kept in `server/transforms/<service>/samples.json`. Correct the
 mapping by editing the module's `RECORDS` table (`Records`, `Entity`, `Prop` in the service's
 `api.py`) — see `docs/transform-authoring.md`. `--force` replaces the whole service directory,
-hand edits included. Undo with `remove-scaffold <service>`, never by deleting the directory (its
+hand edits included, but refuses a hand-written service. Undo with `remove-scaffold <service>`,
+never by deleting the directory (its
 imports stay and the server will not start); it refuses hand-written services, which you remove
 by hand, directory and imports. Add an endpoint to a service with a new `--name`. The scaffolder
 maps JSON only: for CSV or plain text, hand-write the parsing.

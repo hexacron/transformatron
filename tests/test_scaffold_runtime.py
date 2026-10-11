@@ -137,6 +137,25 @@ async def test_keyless_get_fills_the_input_path_segment_and_keeps_other_query_pa
     assert not any(m.startswith("FATAL") for m in messages)
 
 
+async def test_a_long_list_property_is_capped_like_every_other_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """10k tags became one 88 KB property in quadratic time; values are capped at MAX_ITEMS."""
+    cfg = parse_curl_command(
+        "curl https://api.tags.example/ip/8.8.8.8",
+        sample_response={"hostname": "a.example", "tags": ["x", "y"]},
+        service_name="tags",
+    )
+    payload = {"hostname": "b.example", "tags": [f"tag{i}" for i in range(10_000)]}
+    loaded = _load(cfg, payload, tmp_path, monkeypatch)
+
+    results, _ = await loaded.run("tags_lookup", entities.IPv4Address(value="1.1.1.1"))
+
+    [domain] = [r for r in results if isinstance(r, entities.Domain)]
+    tags = str(_props(domain)["tags"]).split(", ")
+    assert tags == [f"tag{i}" for i in range(20)]
+
+
 async def test_curl_headers_user_agent_cookie_and_repeated_params_are_sent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
