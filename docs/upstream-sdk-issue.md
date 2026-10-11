@@ -12,9 +12,9 @@ Returning a `MaltegoGraph` from an async transform silently produces zero entiti
 
 ## Versions
 
-- `maltego-transforms` 1.0.1
-- `maltego-transforms-std-entities` 1.0.0
-- Python 3.13, macOS
+- `maltego-transforms` 1.3.0 (first seen on 1.0.1)
+- `maltego-transforms-std-entities` 1.0.2
+- Python 3.14, macOS
 
 ## Summary
 
@@ -42,7 +42,7 @@ A returned `MaltegoGraph` fails both branches and falls through with no handling
 branch in `__add_async_results` (line 674) also skips graphs, so this affects every async path.
 
 This looks inconsistent with the surrounding code: `__add_entity_result_to_queue` raises
-`ValueError` for an unexpected return type (line 646), so an unusable return is normally loud.
+`ValueError` for an unexpected return type (lines 646-647), so an unusable return is normally loud.
 
 ## Reproduction
 
@@ -91,7 +91,7 @@ Observed:
 Same entity, same handler — the graph is dropped.
 
 End to end, a transform annotated `-> MaltegoGraph[...]` returns
-`State: COMPLETED (success)` with `Entities (0)`; switching the body to return
+`State: COMPLETED (success)` with `Entities (0, 0 distinct)`; switching the body to return
 `list[...]` with the same entities returns all of them.
 
 ## Documentation defect

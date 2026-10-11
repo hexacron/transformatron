@@ -1,13 +1,13 @@
 ---
 name: maltego-transform-author
-description: "Write or modify a Maltego transform in this repository. Use when adding a transform, integrating an API as transforms, or debugging a transform that returns zero entities, does not appear in list_transforms, or shows output type NONE. Covers two SDK behaviours that fail silently."
+description: "Write or modify a Maltego transform in this repository. Use when adding a transform, integrating an API as transforms, scaffolding from cURL or OpenAPI, or debugging a transform that returns zero entities, does not appear in list_transforms, shows output type NONE, or stops the server starting. Covers the SDK guidance that is wrong and the scaffold/run/read loop."
 ---
 
 # Authoring Maltego transforms
 
 **Read `docs/transform-authoring.md` before writing code.** It is the canonical guidance and this
 skill does not restate it — a second copy would drift. This file exists to make sure the checklist
-below is applied every time, because two of the failure modes report success while producing
+below is applied every time, because some of the failure modes report success while producing
 nothing.
 
 ## Non-negotiables
@@ -16,14 +16,17 @@ nothing.
    silently discarded: zero entities, run still reports `COMPLETED (success)`. Use
    `-> list[A | B | C]`; the union still publishes every output type to discovery.
 2. **Annotate both sides.** Input type comes from the first parameter's annotation, output from
-   the return annotation. A bare `-> list` advertises no output type, so the transform appears
-   with output `NONE` and the Maltego client cannot route it.
+   the return annotation: `-> list[Domain]`. With no return annotation the transform appears with
+   output `NONE` and the Maltego client cannot route it. A bare `-> list` stops the server
+   starting, with a registration error that blames `input_entity` — fix the return type.
 3. **Import the module in `server/project.py`**, with the other imports at the top of the file.
    The server registers only what `project.py` imports — the most common reason a new transform
    never appears. Do not append the import to the end of the file: it lands after the
    `if __name__ == "__main__"` block and registers nothing.
-4. **Check the entity count, not the success state.** `run_transform` prints `Entities (N)`.
-   Confirm N > 0.
+4. **Read the run, not the state.** `run_transform` prints `Entities (N, M distinct)` and each
+   message with its level. Confirm N > 0, that M is close to N, and that no `[ERROR]` is hiding in
+   a `COMPLETED (success)` run — an upstream 403 logged with `context.log.fatal` looks exactly
+   like that. With zero entities a `Warning:` line flags it; the exit code stays 0.
 5. **Credentials go in `TransformSetting(auth=True, is_global=True)`**, read at runtime via
    `settings.get(NAME, "")`. Never hardcode a key. Declare the setting name once as a module
    constant and use it on both sides — a literal mistyped on one side silently reads back as the
@@ -45,24 +48,40 @@ nothing.
    look broken.
 6. **Validate `input_entity.value` before interpolating it** into a URL path, query parameter, or
    subprocess call. It is user-controlled.
+7. **Never block.** `async def`, awaited I/O only — no `requests`, sync `httpx`, `time.sleep`.
+   A blocking call pins the runner thread, and `stop`/`restart` then kill the server after 10s.
+8. **`set_property(name, value, display_name=...)`**, never `add_property` — the SDK skills teach
+   it, and it does not exist. Assign typed attributes after construction, not in the constructor.
 
 ## The loop
 
 ```bash
-# 1. scaffold, or hand-write a module under server/transforms/
+# 1. dry-run a scaffold with a real response, and read the field inventory and Notes
 uv run python scripts/transformatron_cli.py scaffold \
   --curl 'curl https://internetdb.shodan.io/8.8.8.8' \
-  --sample-response "$(curl -s https://internetdb.shodan.io/8.8.8.8)"
-#    or --openapi <url|path>; POST operations need --operation <id>; --force overwrites
-# 2. confirm the import is in server/project.py (scaffold writes it)
+  --sample-response "$(curl -s https://internetdb.shodan.io/8.8.8.8)" --dry-run
+#    OpenAPI (URL/path, JSON or YAML): --openapi <spec> --list-operations, then --operation <id>
+#    and --sample-input VALUE unless the spec has an example for the input
+# 2. fix it: --records PATH, --map PATH=Type|Property|Drop, --primary PATH; repeat --dry-run;
+#    then drop --dry-run
 uv run python scripts/transformatron_cli.py restart          # 3. reload
 uv run python scripts/transformatron_cli.py list             # 4. confirm types
-uv run python scripts/transformatron_cli.py run <id> <type> <value> --setting KEY=VALUE
-# 5. check Entities (N); delete fields nobody needs, fix the mapping, go back to 3
+uv run python scripts/transformatron_cli.py run <namespace>.<id> <type> <sample input> --setting KEY=VALUE
+# 5. read count, distinct count, [ERROR]s, properties; edit RECORDS in the module; go back to 3
 ```
 
-With the `transformatron` MCP server available, `scaffold_transform`, `server_restart`,
-`list_transforms` and `run_transform` do the same thing. Both front ends call `src/transformatron/operations.py`.
+`scaffold` prints the `run` command for each transform, with its registered (namespaced) id and
+sample input; the input is also kept in `server/transforms/<service>/samples.json`. Correct the
+mapping by editing the module's `RECORDS` table (`Records`, `Entity`, `Prop` in the service's
+`api.py`) — see `docs/transform-authoring.md`. `--force` replaces the whole service directory,
+hand edits included. Undo with `remove-scaffold <service>`, never by deleting the directory (its
+imports stay and the server will not start); it refuses hand-written services, which you remove
+by hand, directory and imports. Add an endpoint to a service with a new `--name`. The scaffolder
+maps JSON only: for CSV or plain text, hand-write the parsing.
+
+With the `transformatron` MCP server available, `list_operations`, `scaffold_transform`
+(`dry_run=True`), `server_restart`, `list_transforms`, `run_transform` and `remove_scaffold` do
+the same thing. Both front ends call `src/transformatron/operations.py`.
 
 ## Verify before saying it works
 
@@ -72,8 +91,8 @@ uv run python scripts/smoke_test_transforms.py --setting KEY=VALUE
 
 Runs every registered transform and fails on zero entities or an output type of `NONE`. Pass each
 credential with `--setting`; a transform that reports a missing setting is recorded SKIP, so an
-unconfigured key is never mistaken for working code. Add a `TRANSFORM_SAMPLES` entry when the
-per-entity-type sample does not suit a transform.
+unconfigured key is never mistaken for working code. Inputs come from `samples.json` first; add a
+`TRANSFORM_SAMPLES` entry when neither it nor the per-entity-type sample suits a transform.
 
 **A green smoke test does not prove Correction 1 is avoided.** Adding to `context.graph` and
 returning it passes the gate while still being the wrong pattern. Return a list.
@@ -104,10 +123,12 @@ entity selection, pagination, input constraints, TRX migration. Load one at a ti
 | SDK API docs and entity schemas | `maltego-transform-docs` |
 | TRX migration | `maltego-trx-migration-planner` → `-implementer` |
 
-**Two sections of that guidance teach the broken graph return — do not follow them:**
+**Two places in that guidance are wrong — do not follow them:**
 
-- `maltego-transform-build/SKILL.md` §5 "Return Entities"
-- `maltego-transform-basics/references/transform-authoring-patterns.md` §3 "Returning a Graph"
+- The graph return: `maltego-transform-build/SKILL.md` §5 "Return Entities" and
+  `maltego-transform-basics/references/transform-authoring-patterns.md` §3 "Returning a Graph".
+- `entity.add_property(...)`: `maltego-transform-design/references/standard-entity-selection.md`
+  and the TRX migration skills. Use `set_property`.
 
 **Port correction:** those skills default to port 8080. This project runs on **3000** unless
 `transformatron.toml` sets another.
