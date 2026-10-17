@@ -934,5 +934,4 @@ The values in `server/project.py` remain as fallbacks for running that file dire
 
 MIT — see [LICENSE](LICENSE).
 
-Maltego is a trademark of Maltego Technologies GmbH. This is an independent project, not affiliated
-with or endorsed by Maltego.
+Maltego is a trademark of Maltego Technologies GmbH.
